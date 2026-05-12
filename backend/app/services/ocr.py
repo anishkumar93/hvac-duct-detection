@@ -358,8 +358,16 @@ def normalize_dimension(text: str) -> str:
     return t
 
 
+def _is_diameter_label(text: str) -> bool:
+    """Check if text contains any diameter indicator symbol/word."""
+    t = text.lower()
+    return any(s in t for s in ['⌀', '∅', 'ø', 'Ø', 'dia'])
+
+
 def filter_dimensions(ocr_results: list[OCRResult]) -> list[OCRResult]:
-    """Filter OCR results to dimension-like text and normalize."""
+    """Filter OCR results to dimension-like text and normalize.
+    Labels with diameter symbols get higher confidence as they are confirmed duct dimensions.
+    """
     dims = []
     for r in ocr_results:
         r.text = normalize_dimension(r.text)
@@ -372,6 +380,9 @@ def filter_dimensions(ocr_results: list[OCRResult]) -> list[OCRResult]:
                     val = int(match.group(1))
                     if val < 4 or val > 100:
                         break
+                # Boost confidence for diameter indicators — confirmed duct
+                if _is_diameter_label(r.text):
+                    r.confidence = max(r.confidence, 0.90)
                 dims.append(r)
                 break
 

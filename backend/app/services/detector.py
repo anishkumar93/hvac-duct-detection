@@ -40,11 +40,15 @@ def detect_ducts_from_text(binary_image: np.ndarray, dimension_labels: list, sca
         if cx < 0 or cx >= w or cy < 0 or cy >= h:
             continue
 
+        # ⌀/Ø/∅/DIA = confirmed duct, search with wider range
+        is_diameter = any(s in label.text.lower() for s in ['⌀', '∅', 'ø', 'Ø', 'dia'])
+        search = 150 if is_diameter else 120
+
         # Search for horizontal duct (lines above and below text)
-        duct_box, thickness = _find_duct_lines_around_text(h_lines, cx, cy, axis='h', img_w=w, img_h=h)
+        duct_box, thickness = _find_duct_lines_around_text(h_lines, cx, cy, axis='h', img_w=w, img_h=h, search_range=search)
         if duct_box is None:
             # Try vertical duct (lines left and right of text)
-            duct_box, thickness = _find_duct_lines_around_text(v_lines, cx, cy, axis='v', img_w=w, img_h=h)
+            duct_box, thickness = _find_duct_lines_around_text(v_lines, cx, cy, axis='v', img_w=w, img_h=h, search_range=search)
 
         if duct_box:
             boxes.append(duct_box)
@@ -204,33 +208,50 @@ def _find_duct_lines_around_text(line_mask: np.ndarray, cx: int, cy: int,
 
 
 def auto_detect_roi(binary_image: np.ndarray) -> tuple[int, int, int, int]:
-    """Detect main drawing area excluding title block and notes."""
+    """Detect the drawing area by excluding title block (right) and notes (bottom).
+    Uses grid-based density analysis for width, fixed 70% for height.
+    """
     h, w = binary_image.shape[:2]
-    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_rect = None
-    best_area = 0
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < (h * w) * 0.3:
-            continue
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) >= 4 and area > best_area:
-            best_area = area
-            best_rect = cv2.boundingRect(cnt)
+    # Detect title block on the right using grid analysis
+    # Title block cells have high text density with few long drawing lines
+    grid_cols = 10
+    cell_w = w // grid_cols
 
-    if best_rect:
-        x, y, rw, rh = best_rect
-        roi_x1 = x + int(rw * 0.01)
-        roi_y1 = y + int(rh * 0.01)
-        roi_x2 = x + int(rw * 0.82)
-        roi_y2 = y + int(rh * 0.70)
-    else:
-        roi_x1 = int(w * 0.02)
-        roi_y1 = int(h * 0.02)
-        roi_x2 = int(w * 0.80)
-        roi_y2 = int(h * 0.68)
+    min_draw_line = w // 10
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_draw_line, 1))
+    h_lines = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, h_kernel)
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_draw_line))
+    v_lines = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, v_kernel)
+
+    # Remove borders
+    border_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(w * 0.8), 1))
+    border_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(h * 0.8)))
+    borders = cv2.bitwise_or(
+        cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, border_h),
+        cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, border_v)
+    )
+    lines_mask = cv2.subtract(cv2.bitwise_or(h_lines, v_lines), borders)
+    text_mask = cv2.subtract(binary_image, cv2.bitwise_or(h_lines, v_lines))
+
+    # Find rightmost column that has drawing content (lines > text)
+    roi_x2 = w
+    for c in range(grid_cols - 1, grid_cols // 2, -1):
+        x1, x2 = c * cell_w, (c + 1) * cell_w
+        cell_area = h * cell_w
+        line_d = cv2.countNonZero(lines_mask[:, x1:x2]) / cell_area
+        text_d = cv2.countNonZero(text_mask[:, x1:x2]) / cell_area
+        # Title block: very high text density, minimal drawing lines
+        if text_d > 0.08 and text_d > line_d * 5:
+            roi_x2 = c * cell_w
+        else:
+            break
+
+    # Fixed height crop: top 70% is drawing, bottom 30% is notes
+    roi_x1 = int(w * 0.01)
+    roi_y1 = int(h * 0.01)
+    roi_y2 = int(h * 0.70)
+    roi_x2 = max(roi_x2, int(w * 0.5))  # At least 50% width
 
     return roi_x1, roi_y1, roi_x2, roi_y2
 
