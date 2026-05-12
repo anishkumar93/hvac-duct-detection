@@ -1,8 +1,9 @@
 import os
 import cv2
+import numpy as np
 from app.models.schemas import DetectionResult, DuctSegment, DuctType, BoundingBox
 from app.services.preprocessor import preprocess
-from app.services.detector import detect_ducts
+from app.services.detector import detect_ducts, detect_ducts_from_text
 from app.services.ocr import extract_text, extract_text_near_ducts, filter_dimensions, OCRResult
 from app.services.associator import associate_labels
 from app.services.classifier import classify_pressure
@@ -37,9 +38,17 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
     boxes = detect_ducts(image_path, binary, processed_img)
     print(f"[Pipeline] Ducts detected: {len(boxes)}")
 
-    # 3. OCR — wider ROI + targeted OCR near detected ducts
-    full_h, full_w = original_full.shape[:2]
-    ocr_roi = (int(full_w * 0.02), int(full_h * 0.02), int(full_w * 0.85), int(full_h * 0.78))
+    # 3. OCR — use same ROI as detector (drawing area only, excludes notes/title block)
+    from app.services.detector import auto_detect_roi
+    det_roi = auto_detect_roi(binary)  # ROI at processed scale
+    # Scale ROI to full-res coordinates
+    ocr_roi = (
+        int(det_roi[0] * scale_factor),
+        int(det_roi[1] * scale_factor),
+        int(det_roi[2] * scale_factor),
+        int(det_roi[3] * scale_factor),
+    )
+    print(f"[Pipeline] OCR ROI (full-res): {ocr_roi[0]},{ocr_roi[1]} to {ocr_roi[2]},{ocr_roi[3]}")
     ocr_results = extract_text(original_full, roi=ocr_roi)
 
     # Scale boxes to full-res for targeted OCR
@@ -75,6 +84,23 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
             vec_result = OCRResult(text=dim_text, bbox=bbox, confidence=0.95)
             dimension_labels.append(vec_result)
         print(f"[Pipeline] Added {len(vector_data.dimensions)} vector dimensions, total: {len(dimension_labels)}")
+
+    # 3b. Text-first detection: use dimension labels to find ducts around them
+    text_first_boxes, learned_thickness = detect_ducts_from_text(binary, dimension_labels, scale_factor)
+    from app.services.detector import merge_overlapping
+
+    # Scale text-first boxes to full-res
+    text_first_full = [BoundingBox(
+        x=b.x * scale_factor, y=b.y * scale_factor,
+        width=b.width * scale_factor, height=b.height * scale_factor,
+        angle=b.angle) for b in text_first_boxes]
+    # Only reject extreme aspect ratios
+    text_first_full = [b for b in text_first_full
+                       if max(b.width, b.height) / (min(b.width, b.height) + 1) < 20]
+
+    all_boxes = full_boxes + text_first_full
+    full_boxes = merge_overlapping(all_boxes, iou_threshold=0.3)
+    print(f"[Pipeline] After text-first merge: {len(full_boxes)} ducts")
 
     # 4. Associate labels to ducts (use full-res coordinates)
     # Scale max_distance with image size

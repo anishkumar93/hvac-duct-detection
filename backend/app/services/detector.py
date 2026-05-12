@@ -13,6 +13,196 @@ def detect_ducts(image_path: str, binary_image: np.ndarray, original: np.ndarray
     return detect_ducts_line_pairs(binary_image, original)
 
 
+def detect_ducts_from_text(binary_image: np.ndarray, dimension_labels: list, scale_factor: float) -> list[BoundingBox]:
+    """Text-first detection: find parallel lines above/below dimension text.
+    Also learns duct line thickness from confirmed detections.
+    dimension_labels: list of OCRResult with center_x, center_y in full-res coords.
+    Returns BoundingBoxes in processed-image coordinates.
+    """
+    h, w = binary_image.shape[:2]
+    boxes = []
+    confirmed_thicknesses = []
+
+    # Extract horizontal line mask
+    k_scale = max(1, w // 5000 + 1)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25 * k_scale, 1))
+    h_lines = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, h_kernel)
+
+    # Extract vertical line mask
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25 * k_scale))
+    v_lines = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, v_kernel)
+
+    for label in dimension_labels:
+        # Convert label position to processed-image coords
+        cx = int(label.center_x / scale_factor)
+        cy = int(label.center_y / scale_factor)
+
+        if cx < 0 or cx >= w or cy < 0 or cy >= h:
+            continue
+
+        # Search for horizontal duct (lines above and below text)
+        duct_box, thickness = _find_duct_lines_around_text(h_lines, cx, cy, axis='h', img_w=w, img_h=h)
+        if duct_box is None:
+            # Try vertical duct (lines left and right of text)
+            duct_box, thickness = _find_duct_lines_around_text(v_lines, cx, cy, axis='v', img_w=w, img_h=h)
+
+        if duct_box:
+            boxes.append(duct_box)
+            if thickness:
+                confirmed_thicknesses.append(thickness)
+
+    # Learn duct line thickness from confirmed detections
+    if confirmed_thicknesses:
+        avg_thickness = sum(confirmed_thicknesses) / len(confirmed_thicknesses)
+        tolerance = max(avg_thickness * 0.5, 3)
+        print(f"[Detector] Learned duct line thickness: {avg_thickness:.0f}px (±{tolerance:.0f})")
+    else:
+        avg_thickness = None
+
+    print(f"[Detector] Text-first ducts: {len(boxes)}")
+    return boxes, avg_thickness
+
+
+def _find_duct_lines_around_text(line_mask: np.ndarray, cx: int, cy: int,
+                                  axis: str, img_w: int, img_h: int,
+                                  search_range: int = 120) -> tuple[BoundingBox | None, float | None]:
+    """Look for parallel lines around text position.
+    Text is typically INSIDE the duct (overlaid on the duct shape),
+    so lines pass through or very close to the text center.
+    Both lines must have similar thickness (symmetric duct walls).
+    Returns (BoundingBox, line_thickness) or (None, None).
+    """
+    if axis == 'h':
+        line_above = None
+        line_above_thickness = None
+        line_below = None
+        line_below_thickness = None
+
+        x_start = max(0, cx - 200)
+        x_end = min(img_w, cx + 200)
+
+        # Search upward from text center
+        for dy in range(0, search_range):
+            y = cy - dy
+            if y < 0:
+                break
+            row = line_mask[y, x_start:x_end]
+            if np.count_nonzero(row) > 50:
+                line_above = y
+                # Measure thickness: scan further up to find where line ends
+                for t in range(1, 30):
+                    if y - t < 0 or np.count_nonzero(line_mask[y - t, x_start:x_end]) < 50:
+                        line_above_thickness = t
+                        break
+                break
+
+        # Search downward from text center
+        for dy in range(0, search_range):
+            y = cy + dy
+            if y >= img_h:
+                break
+            row = line_mask[y, x_start:x_end]
+            if np.count_nonzero(row) > 50:
+                if line_above is not None and abs(y - line_above) < 10:
+                    continue
+                line_below = y
+                # Measure thickness of bottom line
+                for t in range(1, 30):
+                    if y + t >= img_h or np.count_nonzero(line_mask[y + t, x_start:x_end]) < 50:
+                        line_below_thickness = t
+                        break
+                break
+
+        if line_above is not None and line_below is not None:
+            gap = line_below - line_above
+            if 10 < gap < 150:
+                # Symmetry check: both walls must have similar thickness
+                if line_above_thickness and line_below_thickness:
+                    ratio = max(line_above_thickness, line_below_thickness) / (min(line_above_thickness, line_below_thickness) + 1)
+                    if ratio > 3.0:  # One wall is 3x thicker than the other = not a duct
+                        return None, None
+
+                row = line_mask[line_above, :]
+                cols = np.where(row > 0)[0]
+                if len(cols) > 50:
+                    x1 = int(cols[0])
+                    x2 = int(cols[-1])
+                    duct_w = x2 - x1
+                    mid_y = (line_above + line_below) // 2
+                    if 80 < duct_w < img_w * 0.4:
+                        avg_thickness = (line_above_thickness + line_below_thickness) / 2 if line_below_thickness else line_above_thickness
+                        return BoundingBox(
+                            x=float((x1 + x2) / 2),
+                            y=float(mid_y),
+                            width=float(duct_w),
+                            height=float(gap),
+                            angle=0.0
+                        ), avg_thickness
+    else:  # vertical
+        line_left = None
+        line_left_thickness = None
+        line_right = None
+        line_right_thickness = None
+
+        y_start = max(0, cy - 200)
+        y_end = min(img_h, cy + 200)
+
+        for dx in range(0, search_range):
+            x = cx - dx
+            if x < 0:
+                break
+            col = line_mask[y_start:y_end, x]
+            if np.count_nonzero(col) > 50:
+                line_left = x
+                for t in range(1, 30):
+                    if x - t < 0 or np.count_nonzero(line_mask[y_start:y_end, x - t]) < 50:
+                        line_left_thickness = t
+                        break
+                break
+
+        for dx in range(0, search_range):
+            x = cx + dx
+            if x >= img_w:
+                break
+            col = line_mask[y_start:y_end, x]
+            if np.count_nonzero(col) > 50:
+                if line_left is not None and abs(x - line_left) < 10:
+                    continue
+                line_right = x
+                for t in range(1, 30):
+                    if x + t >= img_w or np.count_nonzero(line_mask[y_start:y_end, x + t]) < 50:
+                        line_right_thickness = t
+                        break
+                break
+
+        if line_left is not None and line_right is not None:
+            gap = line_right - line_left
+            if 10 < gap < 150:
+                # Symmetry check
+                if line_left_thickness and line_right_thickness:
+                    ratio = max(line_left_thickness, line_right_thickness) / (min(line_left_thickness, line_right_thickness) + 1)
+                    if ratio > 3.0:
+                        return None, None
+
+                col = line_mask[:, line_left]
+                rows = np.where(col > 0)[0]
+                if len(rows) > 50:
+                    y1 = int(rows[0])
+                    y2 = int(rows[-1])
+                    duct_h = y2 - y1
+                    if 80 < duct_h < img_h * 0.4:
+                        avg_thickness = (line_left_thickness + line_right_thickness) / 2 if line_right_thickness else line_left_thickness
+                        return BoundingBox(
+                            x=float((line_left + line_right) / 2),
+                            y=float((y1 + y2) / 2),
+                            width=float(gap),
+                            height=float(duct_h),
+                            angle=0.0
+                        ), avg_thickness
+
+    return None, None
+
+
 def auto_detect_roi(binary_image: np.ndarray) -> tuple[int, int, int, int]:
     """Detect main drawing area excluding title block and notes."""
     h, w = binary_image.shape[:2]
@@ -61,8 +251,6 @@ def detect_ducts_line_pairs(binary_image: np.ndarray, original: np.ndarray) -> l
     cv2.imwrite(os.path.join(debug_dir, "01_roi_binary.png"), roi_binary)
 
     boxes = []
-
-    # Scale kernel sizes relative to image (calibrated at ~5000px width)
     k_scale = max(1, roi_w // 5000 + 1)
 
     # --- Horizontal lines ---
@@ -92,9 +280,7 @@ def detect_ducts_line_pairs(binary_image: np.ndarray, original: np.ndarray) -> l
 
     print(f"[Detector] Horizontal line segments: {len(h_segments)}")
 
-    # Scale gap thresholds with image size
     gap_scale = max(1, roi_w // 5000 + 1)
-
     h_boxes = pair_parallel_lines(h_segments, roi_x1, roi_y1, axis='h',
                                   min_gap=10 * gap_scale, max_gap=120 * gap_scale, min_overlap_ratio=0.4)
     boxes.extend(h_boxes)
@@ -158,8 +344,67 @@ def filter_false_positives(boxes: list[BoundingBox], roi_w: int, roi_h: int) -> 
         aspect = duct_length / (duct_thickness + 1)
         if aspect < 2.0:
             continue
+        if aspect > 15.0:  # Too elongated — likely a pipe/column, not a duct
+            continue
 
         filtered.append(box)
+
+    return filtered
+
+
+def _filter_asymmetric_pairs(boxes: list[BoundingBox], roi_binary: np.ndarray,
+                             roi_x1: int, roi_y1: int) -> list[BoundingBox]:
+    """Remove duct detections where the two walls have very different line coverage.
+    A real duct has two solid parallel lines of similar weight.
+    """
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+    h_lines = cv2.morphologyEx(roi_binary, cv2.MORPH_OPEN, h_kernel)
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+    v_lines = cv2.morphologyEx(roi_binary, cv2.MORPH_OPEN, v_kernel)
+
+    roi_h, roi_w = roi_binary.shape[:2]
+    filtered = []
+
+    for box in boxes:
+        cx = int(box.x - roi_x1)
+        cy = int(box.y - roi_y1)
+        is_horizontal = box.width > box.height
+
+        if is_horizontal:
+            top_y = int(cy - box.height / 2)
+            bot_y = int(cy + box.height / 2)
+            x_start = max(0, cx - int(box.width * 0.3))
+            x_end = min(roi_w, cx + int(box.width * 0.3))
+            sample_len = x_end - x_start
+
+            if top_y < 0 or bot_y >= roi_h or sample_len < 20:
+                filtered.append(box)
+                continue
+
+            # Measure coverage: how many pixels in the sample window are line
+            top_coverage = np.count_nonzero(h_lines[top_y, x_start:x_end]) / sample_len
+            bot_coverage = np.count_nonzero(h_lines[bot_y, x_start:x_end]) / sample_len
+        else:
+            left_x = int(cx - box.width / 2)
+            right_x = int(cx + box.width / 2)
+            y_start = max(0, cy - int(box.height * 0.3))
+            y_end = min(roi_h, cy + int(box.height * 0.3))
+            sample_len = y_end - y_start
+
+            if left_x < 0 or right_x >= roi_w or sample_len < 20:
+                filtered.append(box)
+                continue
+
+            top_coverage = np.count_nonzero(v_lines[y_start:y_end, left_x]) / sample_len
+            bot_coverage = np.count_nonzero(v_lines[y_start:y_end, right_x]) / sample_len
+
+        # Both walls must have decent coverage (> 30%) and be similar
+        if top_coverage < 0.2 or bot_coverage < 0.2:
+            continue  # One wall barely exists
+
+        ratio = max(top_coverage, bot_coverage) / (min(top_coverage, bot_coverage) + 0.01)
+        if ratio <= 2.5:
+            filtered.append(box)
 
     return filtered
 

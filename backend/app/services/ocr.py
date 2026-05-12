@@ -62,7 +62,7 @@ def extract_text(image: np.ndarray, roi: tuple = None) -> list[OCRResult]:
 
 
 def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
-    """Run Tesseract with multiple preprocessing strategies and merge results."""
+    """Run Tesseract with geometry lines masked out for cleaner text detection."""
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
@@ -70,7 +70,7 @@ def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
 
     h, w = gray.shape[:2]
 
-    # Downscale if very large (keep higher res for better small text detection)
+    # Downscale if very large
     scale = 1.0
     max_side = 7000
     if max(h, w) > max_side:
@@ -78,38 +78,114 @@ def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         print(f"[OCR] Downscaled for Tesseract: {w}x{h} -> {gray.shape[1]}x{gray.shape[0]}")
 
+    # Create text-only image by masking out geometry lines
+    _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    text_mask = _mask_geometry_lines(binary_inv)
+    # Convert back to white-bg for Tesseract (text=black, bg=white)
+    text_image = cv2.bitwise_not(text_mask)
+
     all_results = []
 
-    # Pass 1: Standard binary threshold (good for dark text on white)
-    _, binary1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    r1 = _run_tesseract_single(binary1, psm=11, tag="pass1")
+    # Pass 1: Text-only (geometry masked out) — primary pass
+    r1 = _run_tesseract_single(text_image, psm=11, tag="pass1_clean")
     all_results.extend(r1)
 
-    # Pass 2: Adaptive threshold (better for varying background)
-    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY, 31, 10)
-    r2 = _run_tesseract_single(adaptive, psm=11, tag="pass2")
+    # Pass 2: Standard binary (fallback for text touching lines)
+    _, binary_std = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    r2 = _run_tesseract_single(binary_std, psm=11, tag="pass2_std")
     all_results.extend(r2)
 
-    # Pass 3: Upscaled with sharpening (catches small dimension text)
-    upscaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-    kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-    sharpened = cv2.filter2D(upscaled, -1, kernel)
-    _, binary3 = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    r3 = _run_tesseract_single(binary3, psm=6, tag="pass3", scale_factor=1.5)
+    # Pass 3: Upscaled text-only (small dimension labels)
+    upscaled = cv2.resize(text_mask, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    r3 = _run_tesseract_single(cv2.bitwise_not(upscaled), psm=6, tag="pass3_up", scale_factor=1.5)
     all_results.extend(r3)
 
-    # Scale all results back to original image coordinates
+    # Scale results back to original coordinates
     if scale != 1.0:
         for r in all_results:
             r.bbox = [[int(p[0] / scale), int(p[1] / scale)] for p in r.bbox]
             r.center_x /= scale
             r.center_y /= scale
 
-    # Deduplicate across passes
     deduped = _deduplicate_results(all_results)
-    # Merge nearby fragments
     return merge_nearby_text(deduped)
+
+
+def _mask_geometry_lines(binary: np.ndarray) -> np.ndarray:
+    """Remove geometry lines using connected component analysis.
+    Keeps text-sized components, removes long/thin line components.
+    Operates on downscaled image for speed, then upscales mask.
+    """
+    h, w = binary.shape[:2]
+
+    # Downscale for faster CCA (2000px is enough to classify components)
+    cca_scale = 1.0
+    if max(h, w) > 2000:
+        cca_scale = 2000 / max(h, w)
+        small = cv2.resize(binary, None, fx=cca_scale, fy=cca_scale, interpolation=cv2.INTER_AREA)
+        _, small = cv2.threshold(small, 127, 255, cv2.THRESH_BINARY)
+    else:
+        small = binary
+
+    sh, sw = small.shape[:2]
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(small, connectivity=8)
+
+    # Build mask of lines to remove
+    line_mask_small = np.zeros_like(small)
+
+    for i in range(1, num_labels):
+        comp_w = stats[i, cv2.CC_STAT_WIDTH]
+        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+        aspect = max(comp_w, comp_h) / (min(comp_w, comp_h) + 1)
+        length = max(comp_w, comp_h)
+
+        is_line = aspect > 12 and length > max(sw, sh) * 0.02
+        is_thick_line = aspect > 6 and length > max(sw, sh) * 0.06
+        is_border = comp_w > sw * 0.8 or comp_h > sh * 0.8
+
+        if is_line or is_thick_line or is_border:
+            line_mask_small[labels == i] = 255
+
+    # Upscale line mask back to original size and dilate to cover edges
+    if cca_scale != 1.0:
+        line_mask = cv2.resize(line_mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        line_mask = line_mask_small
+
+    # Dilate to ensure full line coverage
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    line_mask = cv2.dilate(line_mask, dilate_k, iterations=1)
+
+    # Subtract lines from original
+    text_only = cv2.subtract(binary, line_mask)
+    return text_only
+
+
+def _remove_lines(binary: np.ndarray) -> np.ndarray:
+    """Remove long horizontal and vertical lines from binary image, leaving text.
+    Uses large kernels to only remove lines significantly longer than text characters.
+    """
+    h, w = binary.shape[:2]
+    # Kernel length: ~2% of image width — removes only lines longer than any text
+    k_len = max(80, w // 50)
+
+    # Extract horizontal lines
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_len, 1))
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+
+    # Extract vertical lines
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k_len))
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+
+    # Dilate lines slightly to cover anti-aliased edges
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    lines_mask = cv2.bitwise_or(h_lines, v_lines)
+    lines_mask = cv2.dilate(lines_mask, dilate_k, iterations=1)
+
+    # Subtract from original
+    text_only = cv2.subtract(binary, lines_mask)
+
+    return text_only
 
 
 def _run_tesseract_single(image: np.ndarray, psm: int = 11, tag: str = "",
