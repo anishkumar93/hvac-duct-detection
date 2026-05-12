@@ -8,3 +8,4 @@ numpy==1.26.2
 pytesseract==0.3.10
 ultralytics==8.0.230
 pydantic==2.5.2
+PyMuPDF==1.23.8

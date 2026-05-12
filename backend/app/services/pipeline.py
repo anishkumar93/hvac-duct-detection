@@ -3,15 +3,16 @@ import cv2
 from app.models.schemas import DetectionResult, DuctSegment, DuctType, BoundingBox
 from app.services.preprocessor import preprocess
 from app.services.detector import detect_ducts
-from app.services.ocr import extract_text, extract_text_near_ducts, filter_dimensions
+from app.services.ocr import extract_text, extract_text_near_ducts, filter_dimensions, OCRResult
 from app.services.associator import associate_labels
 from app.services.classifier import classify_pressure
 from app.services.annotator import annotate_image
+from app.services.pdf_analyzer import analyze_pdf
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "outputs")
 
 
-def run_detection_pipeline(image_path: str, file_id: str, scale: str = None) -> DetectionResult:
+def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf_path: str = None) -> DetectionResult:
     """Full detection pipeline: preprocess → detect → OCR → classify → annotate."""
     print(f"[Pipeline] Processing: {image_path}")
 
@@ -19,6 +20,13 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None) -> 
     original_full = cv2.imread(image_path)
     full_h, full_w = original_full.shape[:2]
     print(f"[Pipeline] Full image size: {full_w}x{full_h}")
+
+    # 0. Extract vector data from PDF if available (hybrid approach)
+    vector_data = None
+    if pdf_path and pdf_path.lower().endswith('.pdf'):
+        vector_data = analyze_pdf(pdf_path)
+        if vector_data.dimensions:
+            print(f"[Pipeline] Vector PDF dimensions found: {[d[0] for d in vector_data.dimensions]}")
 
     # 1. Preprocess (downscale for better accuracy - avoids wall false positives)
     processed_img, binary = preprocess(image_path, max_dimension=5000)
@@ -54,6 +62,20 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None) -> 
 
     dimension_labels = filter_dimensions(ocr_results)
     print(f"[Pipeline] OCR results: {len(ocr_results)} total, {len(dimension_labels)} dimensions")
+
+    # Supplement with vector PDF dimensions (more accurate than OCR)
+    if vector_data and vector_data.dimensions:
+        pdf_scale_x = full_w / vector_data.page_width if vector_data.page_width else 1
+        pdf_scale_y = full_h / vector_data.page_height if vector_data.page_height else 1
+        for dim_text, px, py in vector_data.dimensions:
+            # Convert PDF coords to image coords
+            ix = px * pdf_scale_x
+            iy = py * pdf_scale_y
+            bbox = [[int(ix), int(iy)], [int(ix + 50), int(iy)],
+                    [int(ix + 50), int(iy + 20)], [int(ix), int(iy + 20)]]
+            vec_result = OCRResult(text=dim_text, bbox=bbox, confidence=0.95)
+            dimension_labels.append(vec_result)
+        print(f"[Pipeline] Added {len(vector_data.dimensions)} vector dimensions, total: {len(dimension_labels)}")
 
     # 4. Associate labels to ducts (use full-res coordinates)
     # Scale max_distance with image size
