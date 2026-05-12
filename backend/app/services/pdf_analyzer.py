@@ -2,6 +2,7 @@
 
 Detects whether a PDF is vector, raster, or hybrid, and extracts
 structured data (text + line geometry) when available.
+Also validates whether the PDF contains a mechanical/engineering drawing.
 """
 import re
 import math
@@ -11,6 +12,22 @@ try:
     HAS_PYMUPDF = True
 except ImportError:
     HAS_PYMUPDF = False
+
+
+# Keywords that indicate a mechanical/HVAC drawing
+MECHANICAL_KEYWORDS = [
+    'mechanical', 'hvac', 'duct', 'ductwork', 'cfm', 'supply', 'return',
+    'exhaust', 'diffuser', 'rtu', 'ahu', 'vav', 'floor plan',
+    'air handling', 'thermostat', 'grease duct', 'kitchen hood',
+    'pressure', 'damper', 'plenum', 'register',
+]
+
+# Keywords for any engineering/architectural drawing
+DRAWING_KEYWORDS = [
+    'plan', 'elevation', 'section', 'detail', 'schedule',
+    'scale', 'drawn', 'checked', 'revision', 'sheet',
+    'north', 'architect', 'engineer', 'contractor',
+]
 
 
 class PDFVectorData:
@@ -140,3 +157,92 @@ def is_vector_pdf(pdf_path: str) -> bool:
         return num_text > 10 or num_images == 0
     except Exception:
         return False
+
+
+def validate_mechanical_drawing(pdf_path: str) -> tuple[bool, str]:
+    """Check if PDF likely contains a mechanical/engineering drawing.
+    Returns (is_valid, reason).
+    """
+    if not HAS_PYMUPDF:
+        # Can't validate without PyMuPDF, allow it through
+        return True, "ok"
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return False, "Cannot open PDF file"
+
+    if doc.page_count == 0:
+        doc.close()
+        return False, "PDF has no pages"
+
+    page = doc[0]
+    page_w = page.rect.width
+    page_h = page.rect.height
+
+    # Extract all text
+    full_text = page.get_text().lower()
+    text_blocks = page.get_text('blocks')
+    num_text_blocks = len([b for b in text_blocks if len(b) > 4 and b[4].strip()])
+
+    # Count vector paths
+    try:
+        paths = page.get_drawings()
+        num_paths = len(paths)
+    except Exception:
+        num_paths = 0
+
+    num_images = len(page.get_images())
+    doc.close()
+
+    # Score-based validation
+    score = 0
+    reasons = []
+
+    # Check for mechanical keywords
+    mech_hits = sum(1 for kw in MECHANICAL_KEYWORDS if kw in full_text)
+    if mech_hits >= 2:
+        score += 40
+        reasons.append(f"{mech_hits} mechanical keywords")
+
+    # Check for general drawing keywords
+    draw_hits = sum(1 for kw in DRAWING_KEYWORDS if kw in full_text)
+    if draw_hits >= 2:
+        score += 20
+        reasons.append(f"{draw_hits} drawing keywords")
+
+    # Page size: engineering drawings are typically large format
+    # Letter=612x792, Tabloid=792x1224, ARCH D=1728x2592
+    page_area = page_w * page_h
+    if page_area > 1000000:  # Larger than tabloid
+        score += 15
+        reasons.append("large format sheet")
+
+    # Landscape orientation (common for floor plans)
+    if page_w > page_h:
+        score += 5
+        reasons.append("landscape")
+
+    # High line density = engineering drawing
+    if num_paths > 500:
+        score += 20
+        reasons.append(f"{num_paths} vector paths")
+    elif num_paths > 100:
+        score += 10
+
+    # Has embedded images (common in hybrid CAD exports)
+    if num_images > 5:
+        score += 10
+        reasons.append(f"{num_images} embedded images")
+
+    # Minimal text blocks = not a document/report
+    if num_text_blocks < 5 and num_paths < 50 and num_images == 0:
+        return False, "Appears to be an empty or minimal PDF"
+
+    # Threshold
+    if score >= 30:
+        return True, f"Mechanical drawing (score={score}: {', '.join(reasons)})"
+    elif score >= 15:
+        return True, f"Likely engineering drawing (score={score}: {', '.join(reasons)})"
+    else:
+        return False, f"Does not appear to be a mechanical drawing (score={score})"

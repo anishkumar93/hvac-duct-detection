@@ -6,6 +6,7 @@ from app.services.ocr import OCRResult
 def associate_labels(ducts: list[BoundingBox], labels: list[OCRResult], max_distance: float = 800.0) -> dict[int, OCRResult]:
     """Associate each dimension label to its nearest duct segment.
     Prefers labels inside or very close to the duct bbox.
+    When multiple labels match the same duct, prefers higher confidence (vector > OCR).
     Returns mapping: duct_index -> OCRResult.
     """
     associations = {}
@@ -19,7 +20,6 @@ def associate_labels(ducts: list[BoundingBox], labels: list[OCRResult], max_dist
             if dist > max_distance:
                 continue
 
-            # Bonus: label inside duct bbox gets much lower score
             inside = _point_in_bbox(label.center_x, label.center_y, duct, padding=50)
             score = dist * (0.3 if inside else 1.0)
 
@@ -28,17 +28,21 @@ def associate_labels(ducts: list[BoundingBox], labels: list[OCRResult], max_dist
                 best_idx = i
 
         if best_idx >= 0:
-            # Keep closest label per duct
             if best_idx not in associations:
                 associations[best_idx] = label
             else:
                 existing = associations[best_idx]
-                existing_dist = math.hypot(existing.center_x - ducts[best_idx].x,
-                                           existing.center_y - ducts[best_idx].y)
-                new_dist = math.hypot(label.center_x - ducts[best_idx].x,
-                                      label.center_y - ducts[best_idx].y)
-                if new_dist < existing_dist:
+                # Prefer higher confidence (vector=0.95 beats OCR=0.3-0.7)
+                if label.confidence > existing.confidence:
                     associations[best_idx] = label
+                elif label.confidence == existing.confidence:
+                    # Same confidence: prefer closer
+                    existing_dist = math.hypot(existing.center_x - ducts[best_idx].x,
+                                              existing.center_y - ducts[best_idx].y)
+                    new_dist = math.hypot(label.center_x - ducts[best_idx].x,
+                                          label.center_y - ducts[best_idx].y)
+                    if new_dist < existing_dist:
+                        associations[best_idx] = label
 
     return associations
 

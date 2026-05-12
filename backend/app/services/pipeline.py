@@ -63,12 +63,11 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
     dimension_labels = filter_dimensions(ocr_results)
     print(f"[Pipeline] OCR results: {len(ocr_results)} total, {len(dimension_labels)} dimensions")
 
-    # Supplement with vector PDF dimensions (more accurate than OCR)
+    # Supplement with vector PDF dimensions (higher confidence than OCR)
     if vector_data and vector_data.dimensions:
         pdf_scale_x = full_w / vector_data.page_width if vector_data.page_width else 1
         pdf_scale_y = full_h / vector_data.page_height if vector_data.page_height else 1
         for dim_text, px, py in vector_data.dimensions:
-            # Convert PDF coords to image coords
             ix = px * pdf_scale_x
             iy = py * pdf_scale_y
             bbox = [[int(ix), int(iy)], [int(ix + 50), int(iy)],
