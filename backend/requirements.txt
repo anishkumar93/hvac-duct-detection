@@ -10,6 +10,3 @@ easyocr==1.7.2
 ultralytics==8.0.230
 pydantic==2.5.2
 PyMuPDF==1.23.8
-anthropic==0.40.0
-python-dotenv==1.0.0
-easyocr==1.7.2
