@@ -226,18 +226,20 @@ def _run_tesseract_single(image: np.ndarray, psm: int = 11, tag: str = "",
 
 
 def _deduplicate_results(results: list[OCRResult], dist_thresh: int = 30) -> list[OCRResult]:
-    """Remove duplicate detections from multiple passes."""
+    """Remove duplicate detections from multiple passes.
+    Keeps both if text content differs (different passes may read differently).
+    """
     if not results:
         return results
 
-    # Sort by confidence descending — keep higher confidence version
     results.sort(key=lambda r: r.confidence, reverse=True)
     kept = []
     for r in results:
         is_dup = False
         for k in kept:
             if (abs(r.center_x - k.center_x) < dist_thresh and
-                    abs(r.center_y - k.center_y) < dist_thresh):
+                    abs(r.center_y - k.center_y) < dist_thresh and
+                    r.text == k.text):  # Only dedup if SAME text at same position
                 is_dup = True
                 break
         if not is_dup:
@@ -246,7 +248,16 @@ def _deduplicate_results(results: list[OCRResult], dist_thresh: int = 30) -> lis
 
 
 def extract_text_near_ducts(image: np.ndarray, ducts, padding: int = 150) -> list[OCRResult]:
-    """Run OCR specifically in regions near detected ducts for better label capture."""
+    """Run EasyOCR on cropped regions near detected ducts.
+    EasyOCR handles small text overlaid on lines better than Tesseract.
+    """
+    try:
+        import easyocr
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        use_easyocr = True
+    except ImportError:
+        use_easyocr = False
+
     h, w = image.shape[:2]
     all_results = []
     seen_texts = set()
@@ -262,34 +273,41 @@ def extract_text_near_ducts(image: np.ndarray, ducts, padding: int = 150) -> lis
         if crop.size == 0:
             continue
 
-        # Single focused pass on duct region with PSM 6 (block of text)
-        if len(crop.shape) == 3:
-            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if use_easyocr:
+            detections = reader.readtext(crop)
+            for bbox_pts, text, conf in detections:
+                if not text.strip() or conf < 0.15:
+                    continue
+                ebbox = [[int(p[0]) + x1, int(p[1]) + y1] for p in bbox_pts]
+                all_results.append(OCRResult(text=text.strip(), bbox=ebbox, confidence=conf))
         else:
-            gray_crop = crop
-
-        # Upscale small crops for better OCR
-        ch, cw = gray_crop.shape[:2]
-        up = 1.0
-        if max(ch, cw) < 500:
-            up = 500 / max(ch, cw)
-            gray_crop = cv2.resize(gray_crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
-
-        _, binary = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        results = _run_tesseract_single(binary, psm=11, tag=f"duct_{id(duct)}", scale_factor=up)
-
-        for r in results:
-            # Offset to full image coords
-            r.bbox = [[p[0] + x1, p[1] + y1] for p in r.bbox]
-            r.center_x += x1
-            r.center_y += y1
-
-            key = f"{r.text}_{int(r.center_x / 50)}_{int(r.center_y / 50)}"
-            if key not in seen_texts:
-                seen_texts.add(key)
+            # Fallback to Tesseract
+            if len(crop.shape) == 3:
+                gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            else:
+                gray_crop = crop
+            ch, cw = gray_crop.shape[:2]
+            up = max(1.0, 500 / max(ch, cw))
+            if up > 1:
+                gray_crop = cv2.resize(gray_crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+            _, binary = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            results = _run_tesseract_single(binary, psm=11, tag=f"duct_{id(duct)}", scale_factor=up)
+            for r in results:
+                r.bbox = [[p[0] + x1, p[1] + y1] for p in r.bbox]
+                r.center_x += x1
+                r.center_y += y1
                 all_results.append(r)
 
-    return all_results
+    # Deduplicate
+    final = []
+    seen = set()
+    for r in all_results:
+        key = f"{r.text}_{int(r.center_x / 50)}_{int(r.center_y / 50)}"
+        if key not in seen:
+            seen.add(key)
+            final.append(r)
+
+    return final
 
 
 def merge_nearby_text(results: list[OCRResult], max_gap_x: int = 40, max_gap_y: int = 15) -> list[OCRResult]:
