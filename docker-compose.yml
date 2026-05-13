@@ -8,6 +8,11 @@ services:
       - backend_outputs:/app/outputs
     environment:
       - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     restart: unless-stopped
 
   frontend:
@@ -15,7 +20,8 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

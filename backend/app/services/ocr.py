@@ -62,7 +62,7 @@ def extract_text(image: np.ndarray, roi: tuple = None) -> list[OCRResult]:
 
 
 def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
-    """Run Tesseract with multiple preprocessing strategies and merge results."""
+    """Run Tesseract with geometry lines masked out for cleaner text detection."""
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
@@ -70,7 +70,7 @@ def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
 
     h, w = gray.shape[:2]
 
-    # Downscale if very large (keep higher res for better small text detection)
+    # Downscale if very large
     scale = 1.0
     max_side = 7000
     if max(h, w) > max_side:
@@ -78,38 +78,114 @@ def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         print(f"[OCR] Downscaled for Tesseract: {w}x{h} -> {gray.shape[1]}x{gray.shape[0]}")
 
+    # Create text-only image by masking out geometry lines
+    _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    text_mask = _mask_geometry_lines(binary_inv)
+    # Convert back to white-bg for Tesseract (text=black, bg=white)
+    text_image = cv2.bitwise_not(text_mask)
+
     all_results = []
 
-    # Pass 1: Standard binary threshold (good for dark text on white)
-    _, binary1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    r1 = _run_tesseract_single(binary1, psm=11, tag="pass1")
+    # Pass 1: Text-only (geometry masked out) — primary pass
+    r1 = _run_tesseract_single(text_image, psm=11, tag="pass1_clean")
     all_results.extend(r1)
 
-    # Pass 2: Adaptive threshold (better for varying background)
-    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY, 31, 10)
-    r2 = _run_tesseract_single(adaptive, psm=11, tag="pass2")
+    # Pass 2: Standard binary (fallback for text touching lines)
+    _, binary_std = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    r2 = _run_tesseract_single(binary_std, psm=11, tag="pass2_std")
     all_results.extend(r2)
 
-    # Pass 3: Upscaled with sharpening (catches small dimension text)
-    upscaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-    kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-    sharpened = cv2.filter2D(upscaled, -1, kernel)
-    _, binary3 = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    r3 = _run_tesseract_single(binary3, psm=6, tag="pass3", scale_factor=1.5)
+    # Pass 3: Upscaled text-only (small dimension labels)
+    upscaled = cv2.resize(text_mask, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    r3 = _run_tesseract_single(cv2.bitwise_not(upscaled), psm=6, tag="pass3_up", scale_factor=1.5)
     all_results.extend(r3)
 
-    # Scale all results back to original image coordinates
+    # Scale results back to original coordinates
     if scale != 1.0:
         for r in all_results:
             r.bbox = [[int(p[0] / scale), int(p[1] / scale)] for p in r.bbox]
             r.center_x /= scale
             r.center_y /= scale
 
-    # Deduplicate across passes
     deduped = _deduplicate_results(all_results)
-    # Merge nearby fragments
     return merge_nearby_text(deduped)
+
+
+def _mask_geometry_lines(binary: np.ndarray) -> np.ndarray:
+    """Remove geometry lines using connected component analysis.
+    Keeps text-sized components, removes long/thin line components.
+    Operates on downscaled image for speed, then upscales mask.
+    """
+    h, w = binary.shape[:2]
+
+    # Downscale for faster CCA (2000px is enough to classify components)
+    cca_scale = 1.0
+    if max(h, w) > 2000:
+        cca_scale = 2000 / max(h, w)
+        small = cv2.resize(binary, None, fx=cca_scale, fy=cca_scale, interpolation=cv2.INTER_AREA)
+        _, small = cv2.threshold(small, 127, 255, cv2.THRESH_BINARY)
+    else:
+        small = binary
+
+    sh, sw = small.shape[:2]
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(small, connectivity=8)
+
+    # Build mask of lines to remove
+    line_mask_small = np.zeros_like(small)
+
+    for i in range(1, num_labels):
+        comp_w = stats[i, cv2.CC_STAT_WIDTH]
+        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+        aspect = max(comp_w, comp_h) / (min(comp_w, comp_h) + 1)
+        length = max(comp_w, comp_h)
+
+        is_line = aspect > 12 and length > max(sw, sh) * 0.02
+        is_thick_line = aspect > 6 and length > max(sw, sh) * 0.06
+        is_border = comp_w > sw * 0.8 or comp_h > sh * 0.8
+
+        if is_line or is_thick_line or is_border:
+            line_mask_small[labels == i] = 255
+
+    # Upscale line mask back to original size and dilate to cover edges
+    if cca_scale != 1.0:
+        line_mask = cv2.resize(line_mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        line_mask = line_mask_small
+
+    # Dilate to ensure full line coverage
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    line_mask = cv2.dilate(line_mask, dilate_k, iterations=1)
+
+    # Subtract lines from original
+    text_only = cv2.subtract(binary, line_mask)
+    return text_only
+
+
+def _remove_lines(binary: np.ndarray) -> np.ndarray:
+    """Remove long horizontal and vertical lines from binary image, leaving text.
+    Uses large kernels to only remove lines significantly longer than text characters.
+    """
+    h, w = binary.shape[:2]
+    # Kernel length: ~2% of image width — removes only lines longer than any text
+    k_len = max(80, w // 50)
+
+    # Extract horizontal lines
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_len, 1))
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+
+    # Extract vertical lines
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k_len))
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+
+    # Dilate lines slightly to cover anti-aliased edges
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    lines_mask = cv2.bitwise_or(h_lines, v_lines)
+    lines_mask = cv2.dilate(lines_mask, dilate_k, iterations=1)
+
+    # Subtract from original
+    text_only = cv2.subtract(binary, lines_mask)
+
+    return text_only
 
 
 def _run_tesseract_single(image: np.ndarray, psm: int = 11, tag: str = "",
@@ -150,18 +226,20 @@ def _run_tesseract_single(image: np.ndarray, psm: int = 11, tag: str = "",
 
 
 def _deduplicate_results(results: list[OCRResult], dist_thresh: int = 30) -> list[OCRResult]:
-    """Remove duplicate detections from multiple passes."""
+    """Remove duplicate detections from multiple passes.
+    Keeps both if text content differs (different passes may read differently).
+    """
     if not results:
         return results
 
-    # Sort by confidence descending — keep higher confidence version
     results.sort(key=lambda r: r.confidence, reverse=True)
     kept = []
     for r in results:
         is_dup = False
         for k in kept:
             if (abs(r.center_x - k.center_x) < dist_thresh and
-                    abs(r.center_y - k.center_y) < dist_thresh):
+                    abs(r.center_y - k.center_y) < dist_thresh and
+                    r.text == k.text):  # Only dedup if SAME text at same position
                 is_dup = True
                 break
         if not is_dup:
@@ -170,7 +248,16 @@ def _deduplicate_results(results: list[OCRResult], dist_thresh: int = 30) -> lis
 
 
 def extract_text_near_ducts(image: np.ndarray, ducts, padding: int = 150) -> list[OCRResult]:
-    """Run OCR specifically in regions near detected ducts for better label capture."""
+    """Run EasyOCR on cropped regions near detected ducts.
+    EasyOCR handles small text overlaid on lines better than Tesseract.
+    """
+    try:
+        import easyocr
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        use_easyocr = True
+    except ImportError:
+        use_easyocr = False
+
     h, w = image.shape[:2]
     all_results = []
     seen_texts = set()
@@ -186,34 +273,41 @@ def extract_text_near_ducts(image: np.ndarray, ducts, padding: int = 150) -> lis
         if crop.size == 0:
             continue
 
-        # Single focused pass on duct region with PSM 6 (block of text)
-        if len(crop.shape) == 3:
-            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if use_easyocr:
+            detections = reader.readtext(crop)
+            for bbox_pts, text, conf in detections:
+                if not text.strip() or conf < 0.15:
+                    continue
+                ebbox = [[int(p[0]) + x1, int(p[1]) + y1] for p in bbox_pts]
+                all_results.append(OCRResult(text=text.strip(), bbox=ebbox, confidence=conf))
         else:
-            gray_crop = crop
-
-        # Upscale small crops for better OCR
-        ch, cw = gray_crop.shape[:2]
-        up = 1.0
-        if max(ch, cw) < 500:
-            up = 500 / max(ch, cw)
-            gray_crop = cv2.resize(gray_crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
-
-        _, binary = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        results = _run_tesseract_single(binary, psm=11, tag=f"duct_{id(duct)}", scale_factor=up)
-
-        for r in results:
-            # Offset to full image coords
-            r.bbox = [[p[0] + x1, p[1] + y1] for p in r.bbox]
-            r.center_x += x1
-            r.center_y += y1
-
-            key = f"{r.text}_{int(r.center_x / 50)}_{int(r.center_y / 50)}"
-            if key not in seen_texts:
-                seen_texts.add(key)
+            # Fallback to Tesseract
+            if len(crop.shape) == 3:
+                gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            else:
+                gray_crop = crop
+            ch, cw = gray_crop.shape[:2]
+            up = max(1.0, 500 / max(ch, cw))
+            if up > 1:
+                gray_crop = cv2.resize(gray_crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+            _, binary = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            results = _run_tesseract_single(binary, psm=11, tag=f"duct_{id(duct)}", scale_factor=up)
+            for r in results:
+                r.bbox = [[p[0] + x1, p[1] + y1] for p in r.bbox]
+                r.center_x += x1
+                r.center_y += y1
                 all_results.append(r)
 
-    return all_results
+    # Deduplicate
+    final = []
+    seen = set()
+    for r in all_results:
+        key = f"{r.text}_{int(r.center_x / 50)}_{int(r.center_y / 50)}"
+        if key not in seen:
+            seen.add(key)
+            final.append(r)
+
+    return final
 
 
 def merge_nearby_text(results: list[OCRResult], max_gap_x: int = 40, max_gap_y: int = 15) -> list[OCRResult]:
@@ -263,6 +357,9 @@ def normalize_dimension(text: str) -> str:
     t = text.strip()
     t = t.replace('\u201c', '"').replace('\u201d', '"').replace('\u2033', '"')
     t = t.replace('\u2018', "'").replace('\u2019', "'")
+    # 66" or 66 → 6"⌀ (leading 6 is misread ⌀ symbol)
+    t = re.sub(r'^6(\d+)\s*["]+\s*$', r'\1"⌀', t)
+    t = re.sub(r'^6(\d+)\s*$', r'\1"⌀', t)
     # 18"@ or 12"@ -> diameter (@ is common misread of ⌀)
     t = re.sub(r'(\d+)\s*["]+\s*[@]+', r'\1"⌀', t)
     # "18"6" or "12"0" or "14"O" -> diameter
@@ -280,10 +377,25 @@ def normalize_dimension(text: str) -> str:
     # Bare number followed by quote-like -> add "
     t = re.sub(r'(\d+)\s*[`´]+', r'\1"', t)
     return t
+    return t
+
+
+def _is_diameter_label(text: str) -> bool:
+    """Check if text contains any diameter indicator symbol/word."""
+    t = text.lower()
+    return any(s in t for s in ['⌀', '∅', 'ø', 'Ø', 'dia'])
+
+
+def _is_rectangular_label(text: str) -> bool:
+    """Check if text is a rectangular duct dimension (WxH format)."""
+    import re
+    return bool(re.search(r'\d+\s*["\u2033\']*\s*[×xX]\s*\d+', text))
 
 
 def filter_dimensions(ocr_results: list[OCRResult]) -> list[OCRResult]:
-    """Filter OCR results to dimension-like text and normalize."""
+    """Filter OCR results to dimension-like text and normalize.
+    Labels with diameter symbols get higher confidence as they are confirmed duct dimensions.
+    """
     dims = []
     for r in ocr_results:
         r.text = normalize_dimension(r.text)
@@ -296,6 +408,9 @@ def filter_dimensions(ocr_results: list[OCRResult]) -> list[OCRResult]:
                     val = int(match.group(1))
                     if val < 4 or val > 100:
                         break
+                # Boost confidence for confirmed duct indicators (diameter or WxH)
+                if _is_diameter_label(r.text) or _is_rectangular_label(r.text):
+                    r.confidence = max(r.confidence, 0.90)
                 dims.append(r)
                 break
 

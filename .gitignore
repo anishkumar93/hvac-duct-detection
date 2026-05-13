@@ -23,5 +23,9 @@ backend/debug/
 backend/tmp/
 backend/weights/*.pt
 
+# Environment
+.env
+backend/.env
+
 # Logs
 *.log
