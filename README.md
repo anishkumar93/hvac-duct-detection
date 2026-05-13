@@ -12,6 +12,7 @@ Detects, classifies, and annotates HVAC ductwork from mechanical drawings (PDF/I
 - **Vector PDF Extraction** — Extracts text/geometry from vector PDFs (PyMuPDF)
 - **PDF Validation** — Verifies uploaded PDF is a mechanical drawing before processing
 - **Pressure Classification** — Size-based heuristic (High/Medium/Low)
+- **Scale Validation** — Auto-extracts drawing scale from title block, rejects dimension mismatches
 - **Interactive Canvas** — Zoom (scroll), pan (drag), hover/click duct overlays
 - **Duct Schedule** — Sortable table with pressure filter, auto-hides empty columns
 - **Annotated Export** — Download full-res PNG with overlays
@@ -114,6 +115,7 @@ App available at http://localhost:3000. Backend API at http://localhost:8000.
 │ 7. ASSOCIATE + CLASSIFY                                      │
 │    Nearest-label matching with inside-bbox bonus             │
 │    ≤12" → High, 13-24" → Medium, >24" → Low pressure        │
+│    Scale validation: reject if pixel size ≠ stated dimension │
 ├─────────────────────────────────────────────────────────────┤
 │ 8. ANNOTATE                                                  │
 │    Colored overlays + numbered labels on full-res image      │
@@ -233,22 +235,7 @@ Line-pair detection is used to find **candidate duct positions** for EasyOCR cro
 
 ## Suggested Improvements & Scaling
 
-### 1. Drawing Scale Extraction
-
-**What:** Auto-detect the drawing scale from the title block (e.g., `1/4"=1'-0"`) and use it to validate detected duct sizes against their pixel dimensions.
-
-**Best for:**
-- Confirming OCR readings ("18" duct at this scale should be ~112px gap — actual is 139px, close enough")
-- Rejecting false positives ("detected gap is 200px but OCR says 8" — impossible at this scale")
-
-**Trade-offs:**
-| Factor | Impact |
-|--------|--------|
-| Cost | Free (uses existing OCR/vector data) |
-| Complexity | Scale text varies across firms, needs robust parsing |
-| Accuracy gain | Moderate — validates rather than discovers |
-
-### 2. PaddleOCR (Alternative OCR Engine)
+### 1. PaddleOCR (Alternative OCR Engine)
 
 **What:** PaddleOCR (PP-OCRv5) reads small engineering text better than both Tesseract and EasyOCR, but requires PaddlePaddle framework.
 
@@ -266,7 +253,7 @@ Line-pair detection is used to find **candidate duct positions** for EasyOCR cro
 
 **Recommendation:** Use for targeted crops only (not full-image scanning). Falls back to EasyOCR if unavailable.
 
-### 3. LLM Agentic Post-Processing
+### 2. LLM Agentic Post-Processing
 
 **What:** Send structured vector data (text positions + line geometry) to an LLM (Claude/GPT-4) for reasoning about duct classification and OCR validation.
 
@@ -289,7 +276,7 @@ Returns: supply/return classification, corrected dimensions, rejected false posi
 | Accuracy gain | Supply/return classification, fewer false positives |
 | Dependency | Requires API key + internet connectivity |
 
-### 4. YOLOv8 Object Detection
+### 3. YOLOv8 Object Detection
 
 **What:** Train a custom YOLOv8 model on labeled HVAC drawings to detect ducts directly from pixels — no line-pair logic needed.
 
@@ -320,7 +307,7 @@ Returns: supply/return classification, corrected dimensions, rejected false posi
 | Maintenance | Needs retraining when new drawing styles appear |
 | Licensing | AGPL (free/open) or Enterprise (paid/commercial) |
 
-### 5. Vision Language Model (VLM) for OCR
+### 4. Vision Language Model (VLM) for OCR
 
 **What:** Send duct region image crops to a multimodal model (Claude Vision, GPT-4V) to read dimension text that Tesseract/EasyOCR can't.
 

@@ -1,4 +1,5 @@
 import os
+import re
 import cv2
 import numpy as np
 from app.models.schemas import DetectionResult, DuctSegment, DuctType, BoundingBox
@@ -9,6 +10,7 @@ from app.services.associator import associate_labels
 from app.services.classifier import classify_pressure
 from app.services.annotator import annotate_image
 from app.services.pdf_analyzer import analyze_pdf
+from app.services.scale_extractor import extract_scale, compute_pixels_per_inch, validate_duct_dimension
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "outputs")
 
@@ -134,7 +136,30 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
             confidence=conf,
         ))
 
-    # 6. Final cleanup
+    # 6. Scale validation — reject ducts whose pixel size doesn't match stated dimension
+    # Look for scale in title block area (outside main ROI)
+    title_block_roi = (int(full_w * 0.6), int(full_h * 0.6), full_w, full_h)
+    title_results = extract_text(original_full, roi=title_block_roi)
+    drawing_scale = extract_scale(title_results + ocr_results)
+    if drawing_scale:
+        page_w_pts = vector_data.page_width if vector_data else None
+        ppi = compute_pixels_per_inch(drawing_scale, full_w, page_w_pts)
+        print(f"[Pipeline] Scale: {drawing_scale['text']} → {ppi:.1f} px/inch")
+
+        valid_ducts = []
+        for d in ducts:
+            if d.dimension:
+                thickness_px = min(d.bbox.width, d.bbox.height)
+                if validate_duct_dimension(d.dimension, thickness_px, ppi):
+                    valid_ducts.append(d)
+                else:
+                    dim_val = int(re.search(r"(\d+)", d.dimension).group(1))
+                    print(f"[Pipeline] Scale rejected duct #{d.id}: {d.dimension} thickness={thickness_px:.0f}px expected={dim_val * ppi:.0f}px")
+            else:
+                valid_ducts.append(d)
+        ducts = valid_ducts
+
+    # 7. Final cleanup
     ducts = [d for d in ducts
              if 0 < d.bbox.x < full_w and 0 < d.bbox.y < full_h
              and d.bbox.width < full_w * 0.5 and d.bbox.height < full_h * 0.5]
