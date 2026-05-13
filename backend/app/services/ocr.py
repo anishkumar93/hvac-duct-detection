@@ -339,6 +339,9 @@ def normalize_dimension(text: str) -> str:
     t = text.strip()
     t = t.replace('\u201c', '"').replace('\u201d', '"').replace('\u2033', '"')
     t = t.replace('\u2018', "'").replace('\u2019', "'")
+    # 66" or 66 → 6"⌀ (leading 6 is misread ⌀ symbol)
+    t = re.sub(r'^6(\d+)\s*["]+\s*$', r'\1"⌀', t)
+    t = re.sub(r'^6(\d+)\s*$', r'\1"⌀', t)
     # 18"@ or 12"@ -> diameter (@ is common misread of ⌀)
     t = re.sub(r'(\d+)\s*["]+\s*[@]+', r'\1"⌀', t)
     # "18"6" or "12"0" or "14"O" -> diameter
@@ -355,6 +358,7 @@ def normalize_dimension(text: str) -> str:
     t = re.sub(r"(\d+)\s*[']\s*[QO]\s*[\"']", r"\1'-0\"", t)
     # Bare number followed by quote-like -> add "
     t = re.sub(r'(\d+)\s*[`´]+', r'\1"', t)
+    return t
     return t
 
 

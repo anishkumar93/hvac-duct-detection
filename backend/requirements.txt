@@ -9,3 +9,5 @@ pytesseract==0.3.10
 ultralytics==8.0.230
 pydantic==2.5.2
 PyMuPDF==1.23.8
+anthropic==0.40.0
+python-dotenv==1.0.0

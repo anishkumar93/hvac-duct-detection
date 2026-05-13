@@ -2,7 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.routers import upload, export
+from dotenv import load_dotenv
 import os
+
+load_dotenv()  # Loads .env from backend/ directory
 
 app = FastAPI(title="HVAC Duct Detection API", version="0.1.0")
 

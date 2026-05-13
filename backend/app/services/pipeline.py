@@ -9,8 +9,80 @@ from app.services.associator import associate_labels
 from app.services.classifier import classify_pressure
 from app.services.annotator import annotate_image
 from app.services.pdf_analyzer import analyze_pdf
+from app.services.llm_processor import llm_identify_ducts
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "outputs")
+
+
+def _merge_llm_results(cv_ducts: list[DuctSegment], llm_ducts: list[dict],
+                       img_w: int, img_h: int) -> list[DuctSegment]:
+    """Merge LLM-identified ducts with CV-detected ducts.
+    LLM can: add missing dimensions, classify supply/return, boost confidence.
+    """
+    # Map LLM positions (PDF points) to image pixels
+    # PDF page is typically 2592x1728 pts for this drawing
+    # We need to match LLM duct positions to CV duct positions
+
+    type_map = {
+        'supply': DuctType.SUPPLY,
+        'return': DuctType.RETURN,
+        'unknown': DuctType.UNKNOWN,
+    }
+
+    for llm_duct in llm_ducts:
+        lx = llm_duct.get('center_x', 0)
+        ly = llm_duct.get('center_y', 0)
+        ldim = llm_duct.get('dimension', '')
+        ltype = llm_duct.get('type', 'unknown')
+        lconf = llm_duct.get('confidence', 0.5)
+
+        # Scale LLM coords (PDF points) to image pixels
+        # Assume standard PDF: 2592x1728 pts → img_w x img_h
+        scale_x = img_w / 2592 if lx > 0 else 1
+        scale_y = img_h / 1728 if ly > 0 else 1
+        px = lx * scale_x
+        py = ly * scale_y
+
+        # Find nearest CV duct
+        best_idx = -1
+        best_dist = img_w * 0.05  # Max 5% of image
+        for i, duct in enumerate(cv_ducts):
+            dist = ((duct.bbox.x - px)**2 + (duct.bbox.y - py)**2)**0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx >= 0:
+            # Update existing duct with LLM info
+            duct = cv_ducts[best_idx]
+            if ldim and not duct.dimension:
+                duct.dimension = ldim
+                duct.pressure_class = classify_pressure(ldim)
+            if ltype in type_map and ltype != 'unknown':
+                duct.duct_type = type_map[ltype]
+            duct.confidence = max(duct.confidence, lconf)
+        else:
+            # LLM found a duct CV missed — add it
+            if ldim and px > 0 and py > 0:
+                lw = llm_duct.get('width', 200)
+                lh = llm_duct.get('height', 50)
+                new_duct = DuctSegment(
+                    id=len(cv_ducts) + 1,
+                    duct_type=type_map.get(ltype, DuctType.UNKNOWN),
+                    dimension=ldim,
+                    length=None,
+                    pressure_class=classify_pressure(ldim),
+                    bbox=BoundingBox(x=px, y=py, width=float(lw * scale_x),
+                                     height=float(lh * scale_y), angle=0.0),
+                    confidence=lconf,
+                )
+                cv_ducts.append(new_duct)
+
+    # Re-number
+    for i, d in enumerate(cv_ducts):
+        d.id = i + 1
+
+    return cv_ducts
 
 
 def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf_path: str = None) -> DetectionResult:
@@ -122,6 +194,12 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
             bbox=full_bbox,
             confidence=associations[i].confidence if i in associations else 0.0,
         ))
+
+    # 5b. LLM post-processing: refine results using Claude (if API key set)
+    if pdf_path:
+        llm_ducts = llm_identify_ducts(pdf_path, ocr_dimensions=dimension_labels, detected_ducts=ducts)
+        if llm_ducts:
+            ducts = _merge_llm_results(ducts, llm_ducts, full_w, full_h)
 
     # 6. Annotate full-res image
     out_dir = os.path.join(OUTPUT_DIR, file_id)
