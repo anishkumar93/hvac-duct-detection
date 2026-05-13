@@ -40,9 +40,10 @@ def detect_ducts_from_text(binary_image: np.ndarray, dimension_labels: list, sca
         if cx < 0 or cx >= w or cy < 0 or cy >= h:
             continue
 
-        # ⌀/Ø/∅/DIA = confirmed duct, search with wider range
-        is_diameter = any(s in label.text.lower() for s in ['⌀', '∅', 'ø', 'Ø', 'dia'])
-        search = 150 if is_diameter else 120
+        # ⌀/Ø/∅/DIA or WxH format = confirmed duct, search wider
+        is_confirmed_duct = any(s in label.text.lower() for s in ['⌀', '∅', 'ø', 'Ø', 'dia']) or \
+                            any(s in label.text for s in ['×', 'x', 'X'])
+        search = 150 if is_confirmed_duct else 120
 
         # Search for horizontal duct (lines above and below text)
         duct_box, thickness = _find_duct_lines_around_text(h_lines, cx, cy, axis='h', img_w=w, img_h=h, search_range=search)
