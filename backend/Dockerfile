@@ -15,11 +15,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 # Install PyTorch CPU-only (EasyOCR dependency - skip 2GB of CUDA libs)
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Install PaddlePaddle CPU (PaddleOCR dependency)
+RUN pip install --no-cache-dir paddlepaddle paddleocr
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ app/
 
 RUN mkdir -p uploads outputs tmp weights
+
+# PaddleOCR tiling configuration (adjust based on available RAM)
+ENV PADDLE_WORKERS=2
+ENV PADDLE_TILE_W=1000
+ENV PADDLE_TILE_H=600
+ENV PADDLE_OVERLAP=150
 
 EXPOSE 8000
 

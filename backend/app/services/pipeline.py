@@ -12,6 +12,13 @@ from app.services.annotator import annotate_image
 from app.services.pdf_analyzer import analyze_pdf
 from app.services.scale_extractor import extract_scale, compute_pixels_per_inch, validate_duct_dimension
 
+# Use PaddleOCR tiled if available, else EasyOCR
+try:
+    from app.services.paddle_ocr import paddle_ocr_tiled
+    HAS_PADDLE = True
+except ImportError:
+    HAS_PADDLE = False
+
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "outputs")
 
 
@@ -59,12 +66,22 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
                           width=b.width * scale_factor, height=b.height * scale_factor,
                           angle=b.angle) for b in boxes]
 
-    # Run EasyOCR on candidate duct regions (catches small text Tesseract misses)
-    near_results = extract_text_near_ducts(original_full, candidate_boxes, padding=200)
-    extra_dims = filter_dimensions(near_results)
+    # Run targeted OCR on candidate duct regions (catches small text Tesseract misses)
+    # PaddleOCR (tiled, parallel) if available, else EasyOCR
+    if HAS_PADDLE:
+        from app.services.paddle_ocr import PaddleOCRResult
+        paddle_results = paddle_ocr_tiled(original_full, roi=ocr_roi)
+        for pr in paddle_results:
+            near_results.append(OCRResult(text=pr.text, bbox=pr.bbox, confidence=pr.confidence))
+        extra_dims = filter_dimensions([OCRResult(text=pr.text, bbox=pr.bbox, confidence=pr.confidence) for pr in paddle_results])
+    else:
+        near_results = extract_text_near_ducts(original_full, candidate_boxes, padding=200)
+        extra_dims = filter_dimensions(near_results)
+
     if extra_dims:
         dimension_labels.extend(extra_dims)
-        print(f"[Pipeline] EasyOCR targeted found {len(extra_dims)} additional dimensions")
+        engine = "PaddleOCR" if HAS_PADDLE else "EasyOCR"
+        print(f"[Pipeline] {engine} found {len(extra_dims)} additional dimensions")
 
     print(f"[Pipeline] OCR found {len(dimension_labels)} dimension labels total")
 

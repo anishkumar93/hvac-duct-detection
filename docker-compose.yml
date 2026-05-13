@@ -8,6 +8,10 @@ services:
       - backend_outputs:/app/outputs
     environment:
       - PYTHONUNBUFFERED=1
+      - PADDLE_WORKERS=2
+      - PADDLE_TILE_W=1000
+      - PADDLE_TILE_H=600
+      - PADDLE_OVERLAP=150
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
