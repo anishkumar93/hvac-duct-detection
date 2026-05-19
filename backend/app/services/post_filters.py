@@ -91,6 +91,8 @@ def validate_connectivity(
     equipment. An isolated detection with no neighbors is likely a wall segment.
 
     Labelled ducts are never removed (they're confirmed by OCR).
+    Unlabelled ducts whose gap matches a confirmed duct's gap are also kept
+    (they're likely the same duct type, just without a readable label).
     """
     if len(boxes) < 2:
         return boxes, associations
@@ -101,6 +103,12 @@ def validate_connectivity(
         median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 50
         max_endpoint_dist = median_gap * 4.0
 
+    # Collect confirmed duct gaps from labelled ducts
+    confirmed_gaps = set()
+    for i, label in associations.items():
+        if i < len(boxes):
+            confirmed_gaps.add(round(min(boxes[i].width, boxes[i].height)))
+
     # Build connectivity: for each box, check if any endpoint is near another duct
     connected = set()
     for i, bi in enumerate(boxes):
@@ -108,7 +116,6 @@ def validate_connectivity(
         for j, bj in enumerate(boxes):
             if i == j:
                 continue
-            # Check if endpoint of i is near body or endpoint of j
             for ep in eps_i:
                 if _point_near_duct(ep, bj, max_endpoint_dist):
                     connected.add(i)
@@ -117,13 +124,26 @@ def validate_connectivity(
             if i in connected:
                 break
 
-    # Keep connected ducts + all labelled ducts
+    # Keep connected ducts + labelled ducts + ducts matching confirmed gap sizes
     valid_boxes = []
     valid_assoc = {}
     removed = 0
 
     for i, box in enumerate(boxes):
-        if i in connected or i in associations:
+        keep = False
+        if i in connected:
+            keep = True
+        elif i in associations:
+            keep = True
+        elif confirmed_gaps:
+            # Keep if gap matches a confirmed duct size (±20%)
+            gap = round(min(box.width, box.height))
+            for cg in confirmed_gaps:
+                if abs(gap - cg) <= cg * 0.20:
+                    keep = True
+                    break
+
+        if keep:
             new_i = len(valid_boxes)
             valid_boxes.append(box)
             if i in associations:
@@ -200,9 +220,9 @@ def validate_scale_unlabelled(
     min_real = min(confirmed_inches)
     max_real = max(confirmed_inches)
 
-    # Allow range: 50% below smallest to 200% above largest
-    low_bound = min_real * 0.5
-    high_bound = max_real * 2.0
+    # Allow range: 30% below smallest to 150% above largest
+    low_bound = min_real * 0.70
+    high_bound = max_real * 1.5
 
     valid_boxes = []
     valid_assoc = {}

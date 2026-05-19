@@ -18,6 +18,7 @@ import numpy as np
 from app.models.schemas import DetectionResult, DuctSegment, DuctType, BoundingBox
 from app.services.preprocessor import preprocess
 from app.services.geometry import detect_ducts_geometry, detect_drawing_roi
+from app.services.grid_filter import strip_grid_lines
 from app.services.ocr import extract_text, filter_dimensions, OCRResult
 from app.services.associator import associate_labels_optimal
 from app.services.classifier import classify_pressure
@@ -75,6 +76,10 @@ def run_detection_pipeline(
     # Pass original (BGR) so Tesseract-based ROI detection can run at full res
     drawing_roi = detect_drawing_roi(binary, original=original)
     roi_x1, roi_y1, roi_x2, roi_y2 = drawing_roi
+
+    # ── Stage 3b: Drop architectural column/axis grid lines ───────────────────
+    # Conservative dashed-only removal — solid duct walls are not affected.
+    binary = strip_grid_lines(binary, drawing_roi, ppi=ppi)
 
     # ── Stages 4-6: Geometry detection ───────────────────────────────────────
     duct_boxes = detect_ducts_geometry(binary, drawing_roi, ppi=ppi)

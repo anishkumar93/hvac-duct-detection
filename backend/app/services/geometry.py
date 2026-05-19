@@ -105,9 +105,20 @@ def detect_ducts_geometry(
     _dbg(h_mask, "04_h_mask.png")
     _dbg(v_mask, "05_v_mask.png")
 
+    # Compute CC labels (needed for stroke consistency profiling)
+    _, labels_h, _, _ = cv2.connectedComponentsWithStats(h_mask, connectivity=8)
+    _, labels_v, _, _ = cv2.connectedComponentsWithStats(v_mask, connectivity=8)
+
     # ── Stage 4c: CC-based segment extraction ─────────────────────────────────
-    h_segs = _extract_cc_segments(h_mask, axis='h', roi_w=roi_w, roi_h=roi_h)
-    v_segs = _extract_cc_segments(v_mask, axis='v', roi_w=roi_w, roi_h=roi_h)
+    h_segs = _extract_cc_segments(h_mask, labels_h, axis='h', roi_w=roi_w, roi_h=roi_h)
+    v_segs = _extract_cc_segments(v_mask, labels_v, axis='v', roi_w=roi_w, roi_h=roi_h)
+
+    # ── Stage 4d: Stitch broken segments ──────────────────────────────────────
+    # Duct walls broken by overlapping symbols/text appear as multiple short
+    # CCs on the same line.  Merge them before pairing so the full wall length
+    # is available for the length-equality check.
+    h_segs = _stitch_segments(h_segs, axis='h')
+    v_segs = _stitch_segments(v_segs, axis='v')
     print(f"[Geometry] CC segments → H:{len(h_segs)}  V:{len(v_segs)}")
 
     # ── Stage 5: Topological pairing + hollowness gate ────────────────────────
@@ -139,6 +150,19 @@ def detect_ducts_geometry(
     else:
         min_len_px = int(max(roi_w, roi_h) * 0.04)
 
+    # Maximum duct length — real ducts don't span >25% of the ROI.
+    # Detections longer than this are room boundaries or structural walls.
+    max_len_px = int(max(roi_w, roi_h) * 0.25)
+
+    # Maximum gap — reject unrealistically wide detections.
+    # Real HVAC ducts rarely exceed 48" (already capped by max_gap in pairing),
+    # but additional cap at 24" (or 150px without PPI) catches room-width pairs
+    # that slip through when walls happen to be parallel and hollow.
+    if ppi and ppi > 0:
+        max_duct_gap = int(ppi * 24)   # 24" max duct cross-section
+    else:
+        max_duct_gap = 150
+
     # Minimum aspect ratio — equipment boxes are roughly square; real ducts
     # are elongated.  length / gap >= 2.5 keeps any duct that is at least
     # 2.5× longer than it is wide.
@@ -150,6 +174,10 @@ def detect_ducts_geometry(
         gap    = min(b.width, b.height)
         if length < min_len_px:
             continue
+        if length > max_len_px:
+            continue
+        if gap > max_duct_gap:
+            continue
         if gap > 0 and length / gap < MIN_ASPECT:
             continue
         filtered.append(b)
@@ -157,7 +185,8 @@ def detect_ducts_geometry(
     removed = before - len(filtered)
     if removed:
         print(f"[Geometry] Post-pair filter removed {removed} boxes "
-              f"(min_len={min_len_px}px, min_aspect={MIN_ASPECT})")
+              f"(min_len={min_len_px}, max_len={max_len_px}, "
+              f"max_gap={max_duct_gap}, min_aspect={MIN_ASPECT})")
     boxes = filtered
 
     print(f"[Geometry] Final duct candidates: {len(boxes)}")
@@ -353,27 +382,19 @@ def _roi_from_density(binary: np.ndarray, w: int, h: int) -> tuple[int, int, int
 
 def _extract_cc_segments(
     line_mask: np.ndarray,
+    labels: np.ndarray,
     axis: str,
     roi_w: int,
     roi_h: int,
 ) -> list[tuple]:
-    """Build structured segment tuples from a directional line mask.
-
-    Uses connectedComponentsWithStats so every segment carries its exact
-    bounding box (needed for the hollowness corridor bounds at indices 6-9).
-
-    Thickness = area / length.  This is more accurate than bbox height alone
-    because it averages over the entire connected component, including breaks.
-
-    Thickness bounds (1–80 px) are fixed in pixels, NOT PPI-scaled, because
-    pen weight is a rendering choice and does not correspond to duct size.
-    """
+    """Build structured segment tuples from a directional line mask."""
     n, _, stats, _ = cv2.connectedComponentsWithStats(line_mask, connectivity=8)
 
-    # At high resolutions 1-2 px lines are almost exclusively background grid
-    # noise or text sub-elements.  Scale the floor with image size so faint
-    # noise lines are rejected regardless of scan DPI.
-    MIN_THICKNESS = max(3.0, min(roi_w, roi_h) * 0.0005)
+    # Minimum thickness: reject very thin lines (1px noise/grid artifacts).
+    # Real duct walls are at least 2px at 300 DPI. Lines at exactly 2px are
+    # borderline — they could be thin duct walls or grid lines. We keep them
+    # and rely on pairing validation to reject false pairs.
+    MIN_THICKNESS = max(2.0, min(roi_w, roi_h) * 0.0004)
     MAX_THICKNESS = 80.0
     MIN_ASPECT    = 4.0       # length / thickness
 
@@ -401,17 +422,234 @@ def _extract_cc_segments(
         if length / max(thickness, 0.1) < MIN_ASPECT:           continue
         if not (MIN_THICKNESS <= thickness <= MAX_THICKNESS):    continue
 
+        # ── Stroke consistency check ──────────────────────────────────────────
+        # A real duct wall has uniform stroke from end to end.  A CC that is
+        # thin at the edges but thick in the middle (grid line merged with a
+        # duct wall via dilation) is NOT a single uniform segment.
+        # Split such CCs into only the thick (uniform) portion.
         cc_x2, cc_y2 = cc_x + cc_w, cc_y + cc_h
 
-        if axis == 'h':
-            y_c = cc_y + cc_h / 2.0
-            segs.append((float(cc_x), y_c, float(cc_x2), y_c,
-                         length, thickness, cc_x, cc_y, cc_x2, cc_y2))
+        sub_segs = _split_by_stroke_consistency(
+            line_mask, labels, i, cc_x, cc_y, cc_w, cc_h, axis,
+            MIN_THICKNESS, roi_w, roi_h,
+        )
+        if sub_segs:
+            segs.extend(sub_segs)
         else:
-            x_c = cc_x + cc_w / 2.0
-            segs.append((x_c, float(cc_y), x_c, float(cc_y2),
-                         length, thickness, cc_x, cc_y, cc_x2, cc_y2))
+            # CC has uniform stroke — use as-is
+            if axis == 'h':
+                y_c = cc_y + cc_h / 2.0
+                segs.append((float(cc_x), y_c, float(cc_x2), y_c,
+                             length, thickness, cc_x, cc_y, cc_x2, cc_y2))
+            else:
+                x_c = cc_x + cc_w / 2.0
+                segs.append((x_c, float(cc_y), x_c, float(cc_y2),
+                             length, thickness, cc_x, cc_y, cc_x2, cc_y2))
     return segs
+
+
+def _split_by_stroke_consistency(
+    line_mask: np.ndarray,
+    labels: np.ndarray,
+    cc_label: int,
+    cc_x: int, cc_y: int, cc_w: int, cc_h: int,
+    axis: str,
+    min_thickness: float,
+    roi_w: int, roi_h: int,
+    n_samples: int = 20,
+) -> list[tuple] | None:
+    """Check if a CC has a merged grid-line + duct-wall structure and trim it.
+
+    A merged CC has a long thin portion (grid line) connected to a thick
+    portion (duct wall).  We detect this by checking if a LARGE fraction
+    (>30%) of the CC's length is significantly thinner than the thickest
+    portion.  Minor endpoint thinning (normal for duct walls) is ignored.
+
+    Returns:
+        None if the CC is already uniform (caller uses it as-is).
+        List of segment tuples for the thick sub-region if split was needed.
+        Empty list if nothing usable remains after trimming.
+    """
+    # Sample thickness at evenly spaced points
+    profile = []
+    if axis == 'h':
+        for s in range(n_samples):
+            sx = cc_x + int(cc_w * (s + 0.5) / n_samples)
+            if sx < 0 or sx >= line_mask.shape[1]:
+                continue
+            col = labels[cc_y:cc_y + cc_h, sx]
+            count = int(np.count_nonzero(col == cc_label))
+            profile.append((sx, count))
+    else:
+        for s in range(n_samples):
+            sy = cc_y + int(cc_h * (s + 0.5) / n_samples)
+            if sy < 0 or sy >= line_mask.shape[0]:
+                continue
+            row = labels[sy, cc_x:cc_x + cc_w]
+            count = int(np.count_nonzero(row == cc_label))
+            profile.append((sy, count))
+
+    if len(profile) < 4:
+        return None
+
+    thicknesses = [t for _, t in profile]
+    t_max = max(thicknesses)
+    if t_max <= 0:
+        return None
+
+    # A sample is "thin" if it's less than 30% of the max thickness
+    thin_threshold = t_max * 0.30
+    thin_count = sum(1 for t in thicknesses if t <= thin_threshold)
+    thin_fraction = thin_count / len(thicknesses)
+
+    # Only split if >30% of the length is thin (merged grid+duct case).
+    # Minor endpoint thinning (1-2 samples) is normal and ignored.
+    if thin_fraction < 0.30:
+        return None
+
+    # Find the contiguous thick region
+    thick_start = None
+    thick_end = None
+    for pos, t in profile:
+        if t > thin_threshold:
+            if thick_start is None:
+                thick_start = pos
+            thick_end = pos
+
+    if thick_start is None or thick_end is None:
+        return None
+
+    # Build the trimmed sub-segment
+    if axis == 'h':
+        sub_length = float(thick_end - thick_start)
+        if sub_length < roi_w * 0.015:
+            return []  # too short after trimming
+        mid_x = (thick_start + thick_end) // 2
+        col = labels[cc_y:cc_y + cc_h, mid_x]
+        sub_thickness = float(np.count_nonzero(col == cc_label))
+        if sub_thickness < min_thickness:
+            return []
+        y_c = cc_y + cc_h / 2.0
+        return [(float(thick_start), y_c, float(thick_end), y_c,
+                 sub_length, sub_thickness,
+                 thick_start, cc_y, thick_end, cc_y + cc_h)]
+    else:
+        sub_length = float(thick_end - thick_start)
+        if sub_length < roi_h * 0.015:
+            return []
+        mid_y = (thick_start + thick_end) // 2
+        row = labels[mid_y, cc_x:cc_x + cc_w]
+        sub_thickness = float(np.count_nonzero(row == cc_label))
+        if sub_thickness < min_thickness:
+            return []
+        x_c = cc_x + cc_w / 2.0
+        return [(x_c, float(thick_start), x_c, float(thick_end),
+                 sub_length, sub_thickness,
+                 cc_x, thick_start, cc_x + cc_w, thick_end)]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stage 4d — Segment-level stitching
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _stitch_segments(segs: list[tuple], axis: str, max_gap_ratio: float = 0.20) -> list[tuple]:
+    """Merge collinear broken segments into continuous walls.
+
+    Duct walls broken by overlapping symbols/text appear as multiple short
+    CCs on the same centerline.  Merge them if:
+      - Same centerline (perpendicular offset < max thickness)
+      - Similar thickness (ratio ≤ 2.0)
+      - Small gap between endpoints (< 20% of combined length)
+    """
+    if len(segs) < 2:
+        return segs
+
+    # Sort by centerline position then by start coordinate
+    if axis == 'h':
+        segs = sorted(segs, key=lambda s: (round(s[1] / 5) * 5, s[0]))
+    else:
+        segs = sorted(segs, key=lambda s: (round(s[0] / 5) * 5, s[1]))
+
+    merged = list(segs)
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        used = set()
+
+        for i in range(len(merged)):
+            if i in used:
+                continue
+            si = merged[i]
+            best_j = -1
+
+            for j in range(i + 1, len(merged)):
+                if j in used:
+                    continue
+                sj = merged[j]
+
+                if axis == 'h':
+                    # Same centerline y (within max thickness)
+                    if abs(si[1] - sj[1]) > max(si[5], sj[5]) * 1.5:
+                        continue
+                    # Similar thickness
+                    if max(si[5], sj[5]) > min(si[5], sj[5]) * 2.0 + 1:
+                        continue
+                    # Gap between endpoints
+                    gap = sj[0] - si[2]  # left edge of j - right edge of i
+                    if gap < 0:
+                        gap = si[0] - sj[2]  # maybe j is to the left
+                    combined = si[4] + sj[4]
+                    if gap > combined * max_gap_ratio:
+                        continue
+                    if gap > 0 or (min(si[2], sj[2]) - max(si[0], sj[0])) > 0:
+                        best_j = j
+                        break
+                else:
+                    if abs(si[0] - sj[0]) > max(si[5], sj[5]) * 1.5:
+                        continue
+                    if max(si[5], sj[5]) > min(si[5], sj[5]) * 2.0 + 1:
+                        continue
+                    gap = sj[1] - si[3]
+                    if gap < 0:
+                        gap = si[1] - sj[3]
+                    combined = si[4] + sj[4]
+                    if gap > combined * max_gap_ratio:
+                        continue
+                    if gap > 0 or (min(si[3], sj[3]) - max(si[1], sj[1])) > 0:
+                        best_j = j
+                        break
+
+            if best_j >= 0:
+                sj = merged[best_j]
+                if axis == 'h':
+                    new_x1 = min(si[0], sj[0])
+                    new_x2 = max(si[2], sj[2])
+                    new_y = (si[1] * si[4] + sj[1] * sj[4]) / (si[4] + sj[4])
+                    new_len = new_x2 - new_x1
+                    new_thick = (si[5] * si[4] + sj[5] * sj[4]) / (si[4] + sj[4])
+                    new_cc_y1 = min(si[7], sj[7])
+                    new_cc_y2 = max(si[9], sj[9])
+                    out.append((new_x1, new_y, new_x2, new_y, new_len, new_thick,
+                                int(new_x1), new_cc_y1, int(new_x2), new_cc_y2))
+                else:
+                    new_y1 = min(si[1], sj[1])
+                    new_y2 = max(si[3], sj[3])
+                    new_x = (si[0] * si[4] + sj[0] * sj[4]) / (si[4] + sj[4])
+                    new_len = new_y2 - new_y1
+                    new_thick = (si[5] * si[4] + sj[5] * sj[4]) / (si[4] + sj[4])
+                    new_cc_x1 = min(si[6], sj[6])
+                    new_cc_x2 = max(si[8], sj[8])
+                    out.append((new_x, new_y1, new_x, new_y2, new_len, new_thick,
+                                new_cc_x1, int(new_y1), new_cc_x2, int(new_y2)))
+                used.add(i)
+                used.add(best_j)
+                changed = True
+            else:
+                out.append(si)
+
+        merged = out
+    return merged
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -503,7 +741,9 @@ def _pair_and_validate(
             if _is_closed_rectangle(roi_binary, si, sj, axis):
                 continue   # equipment box — both ends are walled
             if _wall_junction_at_endpoint(perp, si, sj, axis):
-                continue   # architectural wall corner — lines turn perpendicular at endpoint
+                continue   # architectural wall corner
+            if _has_t_opening(roi_binary, si, sj, axis):
+                continue   # wall with T-opening — one side has a break
             best_j = j
             break
 
@@ -554,10 +794,11 @@ def _score_pair(
         return 'x'
 
     # Line weight symmetry — duct walls are drawn with the same pen.
-    # Tolerate up to 2.5× difference (scan/ink variance) but reject grossly
-    # mismatched pairs (wall line paired with a thin duct wall, etc.).
+    # Allow up to 2.5× difference (scan variance, anti-aliasing). This rejects
+    # 6px+2px pairs (ratio=3.0) but allows 4px+2px (ratio=2.0) and 6px+3px (ratio=2.0).
+    # The co-terminus check provides additional protection against grid lines.
     wi, wj = si[5], sj[5]
-    if max(wi, wj) > 2.5 * (min(wi, wj) + 1):
+    if max(wi, wj) > 2.5 * min(wi, wj):
         return 'x'
 
     # Length equality — both duct walls run the same distance.
@@ -569,9 +810,24 @@ def _score_pair(
     if len_ratio < 0.70:
         return 'x'
 
-    weight_ratio = min(wi, wj) / (max(wi, wj) + 1)
-    # Lower score = closer gap, higher overlap, more symmetric pair
-    score = gap - (overlap / min_len) * 50 - len_ratio * 80 - weight_ratio * 30
+    # Co-terminus check — duct walls start and end together.
+    # A real duct is a rectangle: both walls share the same start/end x (H)
+    # or y (V).  If one line extends far beyond the other on either side,
+    # it's a grid/wall line accidentally overlapping a duct wall.
+    if axis == 'h':
+        overshoot_left  = abs(si[0] - sj[0])
+        overshoot_right = abs(si[2] - sj[2])
+    else:
+        overshoot_left  = abs(si[1] - sj[1])
+        overshoot_right = abs(si[3] - sj[3])
+    max_overshoot = min(si[4], sj[4]) * 0.30  # allow 30% of shorter line
+    if overshoot_left > max_overshoot or overshoot_right > max_overshoot:
+        return 'x'
+
+    weight_ratio = min(wi, wj) / (max(wi, wj) + 0.1)
+    # Lower score = better match. Heavily penalize weight mismatch so
+    # same-weight pairs are strongly preferred over mixed-weight pairs.
+    score = gap - (overlap / min_len) * 50 - len_ratio * 80 - weight_ratio * 100
     return score
 
 
@@ -822,6 +1078,86 @@ def _wall_junction_at_endpoint(
         return _both_sides_v(y_top) or _both_sides_v(y_bot)
 
 
+def _has_t_opening(
+    roi_binary: np.ndarray,
+    si: tuple, sj: tuple,
+    axis: str,
+    n_samples: int = 10,
+    break_threshold: float = 0.30,
+) -> bool:
+    """Return True if one wall has a significant break (T-opening/doorway).
+
+    A real duct has two continuous parallel walls. A wall with a doorway or
+    T-junction has a gap where one side is broken. Sample both walls at
+    multiple points along the overlap region. If one wall has >30% of
+    samples missing while the other is continuous, it's a wall not a duct.
+    """
+    if len(si) < 10 or len(sj) < 10:
+        return False
+
+    img_h, img_w = roi_binary.shape[:2]
+
+    if axis == 'h':
+        x1 = int(max(si[0], sj[0]))
+        x2 = int(min(si[2], sj[2]))
+        y_top = int(si[1])
+        y_bot = int(sj[1])
+        if x2 <= x1:
+            return False
+
+        top_hits = 0
+        bot_hits = 0
+        for s in range(n_samples):
+            sx = x1 + int((x2 - x1) * (s + 0.5) / n_samples)
+            if 0 <= sx < img_w:
+                # Check top wall (±3px around centerline)
+                y_t = max(0, y_top - 3)
+                y_tb = min(img_h, y_top + 4)
+                if np.any(roi_binary[y_t:y_tb, sx] > 0):
+                    top_hits += 1
+                # Check bottom wall
+                y_b = max(0, y_bot - 3)
+                y_bb = min(img_h, y_bot + 4)
+                if np.any(roi_binary[y_b:y_bb, sx] > 0):
+                    bot_hits += 1
+    else:
+        y1 = int(max(si[1], sj[1]))
+        y2 = int(min(si[3], sj[3]))
+        x_left = int(si[0])
+        x_right = int(sj[0])
+        if y2 <= y1:
+            return False
+
+        top_hits = 0
+        bot_hits = 0
+        for s in range(n_samples):
+            sy = y1 + int((y2 - y1) * (s + 0.5) / n_samples)
+            if 0 <= sy < img_h:
+                x_l = max(0, x_left - 3)
+                x_lr = min(img_w, x_left + 4)
+                if np.any(roi_binary[sy, x_l:x_lr] > 0):
+                    top_hits += 1
+                x_r = max(0, x_right - 3)
+                x_rr = min(img_w, x_right + 4)
+                if np.any(roi_binary[sy, x_r:x_rr] > 0):
+                    bot_hits += 1
+
+    # Both walls should be mostly continuous. If one has a large break
+    # (>30% missing) while the other is solid, it's a wall with opening.
+    if n_samples == 0:
+        return False
+    top_ratio = top_hits / n_samples
+    bot_ratio = bot_hits / n_samples
+
+    # One wall solid (>80%) and the other broken (<70%) = T-opening
+    if top_ratio > 0.80 and bot_ratio < 0.70:
+        return True
+    if bot_ratio > 0.80 and top_ratio < 0.70:
+        return True
+
+    return False
+
+
 def _build_box(
     si: tuple, sj: tuple, axis: str, offset_x: int, offset_y: int
 ) -> BoundingBox | None:
@@ -890,14 +1226,18 @@ def _stitch_collinear(boxes: list[BoundingBox]) -> list[BoundingBox]:
                     continue   # different orientation
 
                 if is_h:
-                    if abs(bi.y - bj.y) > max(bi.height, bj.height) * 0.5:        continue
-                    if max(bi.height, bj.height) / (min(bi.height, bj.height) + 1) > 2.0: continue
+                    # Centreline offset must stay within half the SMALLER box's
+                    # height — using max here lets a previously-inflated box
+                    # cascade-merge with progressively more distant lines.
+                    if abs(bi.y - bj.y) > min(bi.height, bj.height) * 0.5:        continue
+                    # Boxes with significantly different gaps are different ducts
+                    if max(bi.height, bj.height) / (min(bi.height, bj.height) + 1) > 1.5: continue
                     left  = min(bi.x + bi.width / 2, bj.x + bj.width / 2)
                     right = max(bi.x - bi.width / 2, bj.x - bj.width / 2)
                     if right - left > (bi.width + bj.width) * 0.30:               continue
                 else:
-                    if abs(bi.x - bj.x) > max(bi.width, bj.width) * 0.5:         continue
-                    if max(bi.width, bj.width) / (min(bi.width, bj.width) + 1) > 2.0:    continue
+                    if abs(bi.x - bj.x) > min(bi.width, bj.width) * 0.5:         continue
+                    if max(bi.width, bj.width) / (min(bi.width, bj.width) + 1) > 1.5:    continue
                     top = min(bi.y + bi.height / 2, bj.y + bj.height / 2)
                     bot = max(bi.y - bi.height / 2, bj.y - bj.height / 2)
                     if bot - top > (bi.height + bj.height) * 0.30:                continue
