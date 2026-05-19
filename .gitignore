@@ -15,6 +15,7 @@ frontend/build/
 .vscode/
 *.swp
 .DS_Store
+.claude/
 
 # Project generated files
 backend/uploads/

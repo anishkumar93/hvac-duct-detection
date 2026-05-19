@@ -10,3 +10,4 @@ easyocr==1.7.2
 ultralytics==8.0.230
 pydantic==2.5.2
 PyMuPDF==1.23.8
+scipy>=1.11.0

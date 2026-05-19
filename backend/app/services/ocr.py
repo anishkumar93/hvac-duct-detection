@@ -70,14 +70,6 @@ def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
 
     h, w = gray.shape[:2]
 
-    # Downscale if very large
-    scale = 1.0
-    max_side = 7000
-    if max(h, w) > max_side:
-        scale = max_side / max(h, w)
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        print(f"[OCR] Downscaled for Tesseract: {w}x{h} -> {gray.shape[1]}x{gray.shape[0]}")
-
     # Create text-only image by masking out geometry lines
     _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     text_mask = _mask_geometry_lines(binary_inv)
@@ -99,13 +91,6 @@ def _run_tesseract_multipass(image: np.ndarray) -> list[OCRResult]:
     upscaled = cv2.resize(text_mask, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
     r3 = _run_tesseract_single(cv2.bitwise_not(upscaled), psm=6, tag="pass3_up", scale_factor=1.5)
     all_results.extend(r3)
-
-    # Scale results back to original coordinates
-    if scale != 1.0:
-        for r in all_results:
-            r.bbox = [[int(p[0] / scale), int(p[1] / scale)] for p in r.bbox]
-            r.center_x /= scale
-            r.center_y /= scale
 
     deduped = _deduplicate_results(all_results)
     return merge_nearby_text(deduped)
