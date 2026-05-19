@@ -181,6 +181,44 @@ def run_detection_pipeline(image_path: str, file_id: str, scale: str = None, pdf
     )
 
 
+def run_morph_detection_pipeline(image_path: str, file_id: str) -> DetectionResult:
+    """Morphological-only pipeline: no OCR, no vector data.
+    Uses adaptive threshold + morphological kernels + Hough lines + proximity pairing.
+    """
+    from app.services.morph_detector import detect_ducts_morphological
+
+    print(f"[MorphPipeline] Processing: {image_path}")
+    debug_dir = os.path.join(os.path.dirname(__file__), "..", "..", "debug")
+
+    boxes, img_w, img_h = detect_ducts_morphological(image_path, debug_dir=debug_dir)
+
+    original = cv2.imread(image_path)
+
+    ducts = []
+    for i, bbox in enumerate(boxes):
+        ducts.append(DuctSegment(
+            id=i + 1,
+            duct_type=DuctType.UNKNOWN,
+            dimension=None,
+            pressure_class="Unknown",
+            bbox=bbox,
+            confidence=0.75,
+        ))
+
+    # Annotate
+    out_dir = os.path.join(OUTPUT_DIR, file_id)
+    os.makedirs(out_dir, exist_ok=True)
+    annotated_path = os.path.join(out_dir, "annotated.png")
+    annotate_image(original, ducts, annotated_path)
+
+    return DetectionResult(
+        image_width=img_w,
+        image_height=img_h,
+        ducts=ducts,
+        annotated_image_path=f"/outputs/{file_id}/annotated.png",
+    )
+
+
 def _has_nearby_label(bbox: BoundingBox, labels: list, img_w: int) -> bool:
     """Check if any dimension label is near this duct."""
     import math

@@ -97,6 +97,36 @@ body {
   margin-bottom: 12px;
 }
 
+.method-toggle {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.method-toggle label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #a0aec0;
+  cursor: pointer;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid #2d3148;
+  transition: all 0.2s;
+}
+
+.method-toggle label:has(input:checked) {
+  border-color: #4a90d9;
+  color: #e2e8f0;
+  background: #1a2a4a;
+}
+
+.method-toggle input[type="radio"] {
+  accent-color: #4a90d9;
+}
+
 .upload-label {
   display: inline-flex;
   align-items: center;

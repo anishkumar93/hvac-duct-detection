@@ -11,6 +11,7 @@ export default function UploadPanel({ onResult }) {
   const [filename, setFilename] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [method, setMethod] = useState('default');
   const inputRef = useRef();
 
   const processFile = async (file) => {
@@ -31,8 +32,10 @@ export default function UploadPanel({ onResult }) {
     const formData = new FormData();
     formData.append('file', file);
 
+    const params = method === 'morph' ? '?method=morph' : '';
+
     try {
-      const res = await axios.post(`${API_URL}/upload`, formData, {
+      const res = await axios.post(`${API_URL}/upload${params}`, formData, {
         onUploadProgress: (e) => {
           if (e.total) setProgress(Math.round((e.loaded / e.total) * 50));
         },
@@ -83,6 +86,28 @@ export default function UploadPanel({ onResult }) {
       {!loading ? (
         <>
           <div className="upload-icon">📐</div>
+          <div className="method-toggle">
+            <label>
+              <input
+                type="radio"
+                name="method"
+                value="default"
+                checked={method === 'default'}
+                onChange={() => setMethod('default')}
+              />
+              OCR + Lines (Full)
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="method"
+                value="morph"
+                checked={method === 'morph'}
+                onChange={() => setMethod('morph')}
+              />
+              Morphological Only
+            </label>
+          </div>
           <label htmlFor="file-input" className="upload-label">
             Choose HVAC Drawing
           </label>
@@ -97,7 +122,7 @@ export default function UploadPanel({ onResult }) {
             <div className="progress-fill" style={{ width: `${progress}%` }} />
           </div>
           <p className="progress-text">
-            {progress < 50 ? 'Uploading...' : 'Detecting ducts & running OCR...'}
+            {progress < 50 ? 'Uploading...' : method === 'morph' ? 'Detecting ducts (morphological)...' : 'Detecting ducts & running OCR...'}
           </p>
         </div>
       )}

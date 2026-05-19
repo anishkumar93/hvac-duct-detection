@@ -19,9 +19,10 @@ MIN_RESOLUTION = 500  # minimum width or height in pixels
 
 
 @router.post("/upload", response_model=DetectionResult)
-async def upload_file(file: UploadFile = File(...), scale: str = None, resolution: int = None):
+async def upload_file(file: UploadFile = File(...), scale: str = None, resolution: int = None, method: str = None):
     """Upload a drawing for duct detection.
     resolution: processing resolution (5000=fast, 7000=balanced, 10000=high accuracy)
+    method: detection method - 'morph' for morphological-only (no OCR), default uses full pipeline
     """
     # 1. Validate filename
     if not file.filename:
@@ -84,10 +85,14 @@ async def upload_file(file: UploadFile = File(...), scale: str = None, resolutio
 
     # 7. Run detection
     try:
-        # Clamp resolution to valid range
-        res = max(3000, min(resolution or 7000, 15000))
-        pdf_source = file_path if ext == '.pdf' else None
-        result = run_detection_pipeline(image_paths[0], file_id, scale=scale, pdf_path=pdf_source, resolution=res)
+        if method == 'morph':
+            from app.services.pipeline import run_morph_detection_pipeline
+            result = run_morph_detection_pipeline(image_paths[0], file_id)
+        else:
+            # Clamp resolution to valid range
+            res = max(3000, min(resolution or 7000, 15000))
+            pdf_source = file_path if ext == '.pdf' else None
+            result = run_detection_pipeline(image_paths[0], file_id, scale=scale, pdf_path=pdf_source, resolution=res)
     except Exception as e:
         raise HTTPException(500, f"Detection failed: {str(e)}")
 
