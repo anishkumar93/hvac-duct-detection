@@ -18,9 +18,6 @@ Detects, classifies, and annotates HVAC ductwork from mechanical drawings (PDF/I
 - **Annotated Export** — Download full-res PNG with overlays
 - **YOLO Ready** — Drop trained weights into `backend/weights/best.pt` for ML-based detection
 
-## Demo Video
-
-[Watch Demo](https://drive.google.com/file/d/1oJu_yJMSwcGQjevo7N2rpftR9IZAVQSJ/view?usp=sharing)
 
 ## Architecture
 
