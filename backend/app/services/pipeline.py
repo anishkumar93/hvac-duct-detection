@@ -25,6 +25,14 @@ from app.services.annotator import annotate_image
 from app.services.scale_extractor import (
     extract_scale, compute_pixels_per_inch, validate_duct_dimension,
 )
+from app.services.post_filters import (
+    filter_by_context,
+    validate_connectivity,
+    filter_boundary_detections,
+    validate_scale_unlabelled,
+    compute_confidence_scores,
+    filter_closed_short_corridors,
+)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "outputs")
 
@@ -90,12 +98,50 @@ def run_detection_pipeline(
         duct_boxes, associations = _scale_validate(duct_boxes, associations, ppi)
     print(f"[Pipeline] After scale validation: {len(duct_boxes)} ducts")
 
+    # ── Post-detection false-positive filters ─────────────────────────────────
+    pre_filter_count = len(duct_boxes)
+
+    # Filter equipment boxes (nearly-square with internal structure)
+    duct_boxes, associations = filter_closed_short_corridors(
+        duct_boxes, associations, binary[roi_y1:roi_y2, roi_x1:roi_x2],
+        roi_offset=(roi_x1, roi_y1),
+    )
+
+    # Remove detections near non-duct text (room labels, equipment tags)
+    duct_boxes, associations = filter_by_context(
+        duct_boxes, associations, ocr_results,
+    )
+
+    # Remove unlabelled ducts whose size doesn't match confirmed ducts
+    duct_boxes, associations = validate_scale_unlabelled(
+        duct_boxes, associations, ppi,
+    )
+
+    # Remove isolated detections not connected to any other duct
+    duct_boxes, associations = validate_connectivity(
+        duct_boxes, associations,
+    )
+
+    # Remove detections at ROI boundary (partial walls)
+    duct_boxes, associations = filter_boundary_detections(
+        duct_boxes, associations, drawing_roi,
+    )
+
+    post_filter_count = len(duct_boxes)
+    if pre_filter_count != post_filter_count:
+        print(f"[Pipeline] Post-filters: {pre_filter_count} → {post_filter_count} ducts")
+
+    # ── Confidence scoring ────────────────────────────────────────────────────
+    confidence_scores = compute_confidence_scores(
+        duct_boxes, associations, ocr_results, ppi, drawing_roi,
+    )
+
     # ── Stage 9: Build DuctSegment objects ────────────────────────────────────
     ducts = []
     for i, bbox in enumerate(duct_boxes):
         label    = associations.get(i)
         dim_text = label.text       if label else None
-        conf     = label.confidence if label else 0.60  # geometry-only
+        conf     = confidence_scores[i] if i < len(confidence_scores) else 0.50
         ducts.append(DuctSegment(
             id=i + 1,
             duct_type=DuctType.UNKNOWN,
