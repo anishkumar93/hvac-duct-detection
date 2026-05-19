@@ -1,7 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from app.models.schemas import DetectionResult
 from app.services.pdf_converter import convert_to_images
-from app.services.pdf_analyzer import validate_mechanical_drawing
 from app.services.pipeline import run_detection_pipeline
 import os
 import uuid
@@ -56,13 +55,6 @@ async def upload_file(file: UploadFile = File(...), scale: str = None, resolutio
 
     # 5. Convert PDF or validate image
     if ext == ".pdf":
-        # Validate it's a mechanical drawing
-        is_valid, reason = validate_mechanical_drawing(file_path)
-        if not is_valid:
-            shutil.rmtree(file_dir, ignore_errors=True)
-            raise HTTPException(422, f"Invalid drawing: {reason}")
-        print(f"[Upload] PDF validation: {reason}")
-
         try:
             image_paths = convert_to_images(file_path, file_dir)
         except Exception as e:
@@ -84,10 +76,8 @@ async def upload_file(file: UploadFile = File(...), scale: str = None, resolutio
 
     # 7. Run detection
     try:
-        # Clamp resolution to valid range
-        res = max(3000, min(resolution or 7000, 15000))
         pdf_source = file_path if ext == '.pdf' else None
-        result = run_detection_pipeline(image_paths[0], file_id, scale=scale, pdf_path=pdf_source, resolution=res)
+        result = run_detection_pipeline(image_paths[0], file_id, scale=scale, pdf_path=pdf_source)
     except Exception as e:
         raise HTTPException(500, f"Detection failed: {str(e)}")
 
