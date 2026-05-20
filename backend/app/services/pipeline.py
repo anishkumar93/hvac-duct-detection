@@ -98,6 +98,22 @@ def run_detection_pipeline(
         duct_boxes, dimension_labels, max_distance=max_dist
     )
 
+    # ── Stage 8b: Text-first fallback for unmatched labels ────────────────────
+    # If a dimension label wasn't associated with any geometry-detected duct,
+    # search for parallel lines near that label and create a duct if found.
+    unmatched_labels = [l for l in dimension_labels
+                        if l not in associations.values()]
+    if unmatched_labels:
+        fallback_boxes = _text_first_fallback(
+            binary, unmatched_labels, drawing_roi, ppi
+        )
+        if fallback_boxes:
+            for fb_box, fb_label in fallback_boxes:
+                new_idx = len(duct_boxes)
+                duct_boxes.append(fb_box)
+                associations[new_idx] = fb_label
+            print(f"[Pipeline] Text-first fallback added {len(fallback_boxes)} ducts")
+
     # ── Scale validation (soft gate — only rejects labelled ducts) ────────────
     if ppi:
         duct_boxes, associations = _scale_validate(duct_boxes, associations, ppi)
@@ -257,3 +273,208 @@ def _scale_validate(
             valid_assoc[new_i] = label
 
     return valid_boxes, valid_assoc
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stage 8b — Text-first fallback for unmatched dimension labels
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _text_first_fallback(
+    binary: np.ndarray,
+    unmatched_labels: list,
+    roi: tuple[int, int, int, int],
+    ppi: float | None,
+) -> list[tuple]:
+    """Search for parallel lines near unmatched dimension labels.
+
+    For each label not associated with a geometry-detected duct, crop the
+    binary around the label position and look for two parallel lines forming
+    a duct. Uses relaxed thresholds (allows 2px walls) since the label
+    confirms a duct should exist here.
+
+    Returns list of (BoundingBox, OCRResult) tuples for newly found ducts.
+    """
+    roi_x1, roi_y1, roi_x2, roi_y2 = roi
+    img_h, img_w = binary.shape[:2]
+    results = []
+
+    # Search radius around label (in pixels)
+    search = int(ppi * 30) if ppi else 200  # 30" real or 200px
+
+    for label in unmatched_labels:
+        cx = int(label.center_x)
+        cy = int(label.center_y)
+
+        # Crop region around label
+        crop_x1 = max(0, cx - search)
+        crop_y1 = max(0, cy - search)
+        crop_x2 = min(img_w, cx + search)
+        crop_y2 = min(img_h, cy + search)
+        crop = binary[crop_y1:crop_y2, crop_x1:crop_x2]
+
+        if crop.size == 0:
+            continue
+
+        # Try horizontal duct first, then vertical
+        box = _find_duct_near_label(crop, cx - crop_x1, cy - crop_y1,
+                                    crop_x1, crop_y1, ppi)
+        if box:
+            results.append((box, label))
+
+    return results
+
+
+def _find_duct_near_label(
+    crop: np.ndarray,
+    local_cx: int, local_cy: int,
+    offset_x: int, offset_y: int,
+    ppi: float | None,
+) -> 'BoundingBox | None':
+    """Find a duct (parallel line pair) near a label position in a crop.
+
+    Searches for horizontal lines above/below the label, then vertical
+    lines left/right. Returns the first valid duct found.
+    """
+    from app.models.schemas import BoundingBox
+
+    crop_h, crop_w = crop.shape[:2]
+
+    # Minimum line length for a duct wall
+    min_line_len = int(ppi * 12) if ppi else 80  # 12" or 80px
+
+    # Extract horizontal lines
+    h_klen = max(30, min_line_len // 2)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_klen, 1))
+    h_lines = cv2.morphologyEx(crop, cv2.MORPH_OPEN, h_kernel)
+
+    # Search for H-duct: lines above and below label
+    box = _search_parallel_pair(h_lines, local_cx, local_cy, 'h',
+                                crop_w, crop_h, offset_x, offset_y, ppi)
+    if box:
+        return box
+
+    # Extract vertical lines
+    v_klen = max(30, min_line_len // 2)
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_klen))
+    v_lines = cv2.morphologyEx(crop, cv2.MORPH_OPEN, v_kernel)
+
+    # Search for V-duct: lines left and right of label
+    box = _search_parallel_pair(v_lines, local_cx, local_cy, 'v',
+                                crop_w, crop_h, offset_x, offset_y, ppi)
+    return box
+
+
+def _search_parallel_pair(
+    line_mask: np.ndarray,
+    cx: int, cy: int,
+    axis: str,
+    crop_w: int, crop_h: int,
+    offset_x: int, offset_y: int,
+    ppi: float | None,
+) -> 'BoundingBox | None':
+    """Search for a parallel line pair near (cx, cy) in the line mask."""
+    from app.models.schemas import BoundingBox
+
+    # Gap range for valid ducts
+    min_gap = int(ppi * 6) if ppi else 20
+    max_gap = int(ppi * 36) if ppi else 250
+    search_range = max_gap + 20
+
+    if axis == 'h':
+        # Scan vertically from label center to find lines above and below
+        line_above = None
+        line_below = None
+
+        for dy in range(1, search_range):
+            # Search above
+            y_up = cy - dy
+            if y_up >= 0 and line_above is None:
+                row = line_mask[y_up, max(0, cx - 100):min(crop_w, cx + 100)]
+                if np.count_nonzero(row) > 40:
+                    line_above = y_up
+
+            # Search below
+            y_dn = cy + dy
+            if y_dn < crop_h and line_below is None:
+                row = line_mask[y_dn, max(0, cx - 100):min(crop_w, cx + 100)]
+                if np.count_nonzero(row) > 40:
+                    line_below = y_dn
+
+            if line_above is not None and line_below is not None:
+                break
+
+        if line_above is None or line_below is None:
+            return None
+
+        gap = line_below - line_above
+        if gap < min_gap or gap > max_gap:
+            return None
+
+        # Measure duct length from the line mask
+        row_top = line_mask[line_above, :]
+        cols = np.where(row_top > 0)[0]
+        if len(cols) < 40:
+            return None
+        x1, x2 = int(cols[0]), int(cols[-1])
+        duct_len = x2 - x1
+
+        # Minimum length check
+        min_len = int(ppi * 12) if ppi else 80
+        if duct_len < min_len:
+            return None
+
+        # Build box in full-image coordinates
+        return BoundingBox(
+            x=float(offset_x + (x1 + x2) / 2),
+            y=float(offset_y + (line_above + line_below) / 2),
+            width=float(duct_len),
+            height=float(gap),
+            angle=0.0,
+        )
+
+    else:  # vertical
+        line_left = None
+        line_right = None
+
+        for dx in range(1, search_range):
+            x_l = cx - dx
+            if x_l >= 0 and line_left is None:
+                col = line_mask[max(0, cy - 100):min(crop_h, cy + 100), x_l]
+                if np.count_nonzero(col) > 40:
+                    line_left = x_l
+
+            x_r = cx + dx
+            if x_r < crop_w and line_right is None:
+                col = line_mask[max(0, cy - 100):min(crop_h, cy + 100), x_r]
+                if np.count_nonzero(col) > 40:
+                    line_right = x_r
+
+            if line_left is not None and line_right is not None:
+                break
+
+        if line_left is None or line_right is None:
+            return None
+
+        gap = line_right - line_left
+        if gap < min_gap or gap > max_gap:
+            return None
+
+        col_left = line_mask[:, line_left]
+        rows = np.where(col_left > 0)[0]
+        if len(rows) < 40:
+            return None
+        y1, y2 = int(rows[0]), int(rows[-1])
+        duct_len = y2 - y1
+
+        min_len = int(ppi * 12) if ppi else 80
+        if duct_len < min_len:
+            return None
+
+        return BoundingBox(
+            x=float(offset_x + (line_left + line_right) / 2),
+            y=float(offset_y + (y1 + y2) / 2),
+            width=float(gap),
+            height=float(duct_len),
+            angle=0.0,
+        )
+
