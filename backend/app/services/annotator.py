@@ -19,28 +19,28 @@ def annotate_image(image: np.ndarray, ducts: list[DuctSegment], output_path: str
         color = COLORS.get(duct.pressure_class, (0, 180, 0))
         bbox = duct.bbox
 
-        # Determine if horizontal or vertical duct
-        is_horizontal = bbox.width > bbox.height
+        # Check if angled duct
+        is_angled = bbox.angle is not None and abs(bbox.angle) > 5
 
-        if is_horizontal:
-            # Draw thick horizontal center line
+        if is_angled:
+            _draw_angled_duct(annotated, bbox, color)
+        elif bbox.width > bbox.height:
+            # Horizontal duct
             x1 = int(bbox.x - bbox.width / 2)
             x2 = int(bbox.x + bbox.width / 2)
             cy = int(bbox.y)
             thickness = max(4, int(bbox.height * 0.4))
 
-            # Semi-transparent line using overlay
             overlay = annotated.copy()
             cv2.line(overlay, (x1, cy), (x2, cy), color, thickness)
             cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
 
-            # Solid border lines (top and bottom of duct)
             y_top = int(bbox.y - bbox.height / 2)
             y_bot = int(bbox.y + bbox.height / 2)
             cv2.line(annotated, (x1, y_top), (x2, y_top), color, 2)
             cv2.line(annotated, (x1, y_bot), (x2, y_bot), color, 2)
         else:
-            # Draw thick vertical center line
+            # Vertical duct
             y1 = int(bbox.y - bbox.height / 2)
             y2 = int(bbox.y + bbox.height / 2)
             cx = int(bbox.x)
@@ -56,6 +56,7 @@ def annotate_image(image: np.ndarray, ducts: list[DuctSegment], output_path: str
             cv2.line(annotated, (x_right, y1), (x_right, y2), color, 2)
 
         # Numbered label
+        is_horizontal = bbox.width > bbox.height and not is_angled
         label_x = int(bbox.x)
         label_y = int(bbox.y - bbox.height / 2 - 25) if is_horizontal else int(bbox.y)
         cv2.circle(annotated, (label_x, label_y), 18, (0, 0, 0), -1)
@@ -78,3 +79,44 @@ def annotate_image(image: np.ndarray, ducts: list[DuctSegment], output_path: str
 
     cv2.imwrite(output_path, annotated)
     return output_path
+
+
+def _draw_angled_duct(annotated: np.ndarray, bbox, color: tuple) -> None:
+    """Draw an angled duct with center line + border lines (same style as H/V)."""
+    cx, cy = int(bbox.x), int(bbox.y)
+    length = bbox.width
+    gap = bbox.height
+    angle_rad = np.radians(bbox.angle)
+
+    # Direction along the duct
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    # Perpendicular direction
+    cos_p = np.cos(angle_rad + np.pi / 2)
+    sin_p = np.sin(angle_rad + np.pi / 2)
+
+    half_len = length / 2
+    half_gap = gap / 2
+
+    # Center line endpoints (along duct direction)
+    p1 = (int(cx - half_len * cos_a), int(cy - half_len * sin_a))
+    p2 = (int(cx + half_len * cos_a), int(cy + half_len * sin_a))
+
+    # Semi-transparent center line
+    thickness = max(4, int(gap * 0.4))
+    overlay = annotated.copy()
+    cv2.line(overlay, p1, p2, color, thickness)
+    cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
+
+    # Border lines (top and bottom walls, offset perpendicular to duct direction)
+    top_p1 = (int(cx - half_len * cos_a + half_gap * cos_p),
+              int(cy - half_len * sin_a + half_gap * sin_p))
+    top_p2 = (int(cx + half_len * cos_a + half_gap * cos_p),
+              int(cy + half_len * sin_a + half_gap * sin_p))
+    bot_p1 = (int(cx - half_len * cos_a - half_gap * cos_p),
+              int(cy - half_len * sin_a - half_gap * sin_p))
+    bot_p2 = (int(cx + half_len * cos_a - half_gap * cos_p),
+              int(cy + half_len * sin_a - half_gap * sin_p))
+
+    cv2.line(annotated, top_p1, top_p2, color, 2)
+    cv2.line(annotated, bot_p1, bot_p2, color, 2)

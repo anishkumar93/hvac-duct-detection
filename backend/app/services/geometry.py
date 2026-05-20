@@ -189,6 +189,16 @@ def detect_ducts_geometry(
               f"max_gap={max_duct_gap}, min_aspect={MIN_ASPECT})")
     boxes = filtered
 
+    # ── Stage 6c: Angled duct detection (rotated rectangle CC analysis) ─────
+    angled = _detect_angled_ducts(roi_binary, min_gap, max_gap,
+                                  roi_x1, roi_y1, min_len_px, ppi)
+    if angled:
+        for ab in angled:
+            if not any(_iou(ab, eb) > 0.3 or _containment(ab, eb) > 0.5
+                       for eb in boxes):
+                boxes.append(ab)
+        print(f"[Geometry] Angled ducts added: {len(angled)}")
+
     print(f"[Geometry] Final duct candidates: {len(boxes)}")
     return boxes
 
@@ -1282,9 +1292,199 @@ def _build_box(
         )
 
 
+
 # ═════════════════════════════════════════════════════════════════════════════
-# Stage 6 — Collinear stitching + overlap merge
+# Stage 6c — Angled duct detection (CC + minAreaRect)
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _detect_angled_ducts(
+    roi_binary: np.ndarray,
+    min_gap: int,
+    max_gap: int,
+    offset_x: int,
+    offset_y: int,
+    min_len_px: int,
+    ppi: float | None,
+) -> list[BoundingBox]:
+    """Detect angled ducts using rotated morphological isolation + CC pairing.
+
+    Strategy:
+    1. Apply morphological OPEN with rotated kernels at multiple angles
+       to isolate diagonal lines (same principle as H/V isolation in Stage 4)
+    2. For each angle, find CCs via minAreaRect
+    3. Group and pair parallel CCs (same angle, gap distance apart)
+    4. Validate: length ratio, co-terminus, thickness match
+    """
+    roi_h, roi_w = roi_binary.shape[:2]
+    MIN_ASPECT = 5.0
+    kernel_len = max(50, min_len_px // 2)
+
+    # Angles to scan (skip H/V which are handled by Stage 4-5)
+    angles_to_scan = [30, 45, 60, 120, 135, 150]
+
+    all_segments = []  # (cx, cy, length, thickness, angle)
+
+    for angle_deg in angles_to_scan:
+        # Create rotated kernel
+        kernel = _make_rotated_kernel(kernel_len, angle_deg)
+        # Morphological OPEN isolates lines at this angle
+        angle_mask = cv2.morphologyEx(roi_binary, cv2.MORPH_OPEN, kernel)
+
+        if np.count_nonzero(angle_mask) == 0:
+            continue
+
+        # Find CCs in the isolated mask
+        contours, _ = cv2.findContours(angle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            if len(cnt) < 5:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (cx, cy), (w, h), rect_angle = rect
+
+            # Normalize: width = longer side
+            if w < h:
+                w, h = h, w
+
+            if h < 1 or w / h < MIN_ASPECT:
+                continue
+            if w < min_len_px * 0.4:
+                continue
+            if h > 20:
+                continue
+            # Skip if too long (room boundary)
+            if w > max(roi_w, roi_h) * 0.25:
+                continue
+
+            all_segments.append((cx, cy, w, h, float(angle_deg)))
+
+    if len(all_segments) < 2:
+        return []
+
+    # Group by angle
+    angle_groups: dict[int, list] = {}
+    for seg in all_segments:
+        angle_groups.setdefault(int(seg[4]), []).append(seg)
+
+    # Pair parallel segments — use spatial clustering to reject hatching
+    boxes = []
+    for bucket, group in angle_groups.items():
+        if len(group) < 2:
+            continue
+        # Instead of rejecting entire angle group if >6, pair greedily
+        # and reject pairs where there are many other parallel lines nearby
+        pairs = _pair_angled_segments(group, min_gap, max_gap, min_len_px)
+        for si, sj, gap in pairs:
+            # Count how many OTHER segments are parallel and nearby
+            # (within 2x gap distance of this pair's center)
+            pair_cx = (si[0] + sj[0]) / 2
+            pair_cy = (si[1] + sj[1]) / 2
+            nearby = sum(1 for s in group
+                         if s is not si and s is not sj
+                         and np.hypot(s[0] - pair_cx, s[1] - pair_cy) < gap * 3)
+            if nearby > 4:
+                continue  # local hatching cluster — reject
+
+            box = BoundingBox(
+                x=float(offset_x + pair_cx),
+                y=float(offset_y + pair_cy),
+                width=float((si[2] + sj[2]) / 2),
+                height=float(gap),
+                angle=float(si[4]),
+            )
+            if max(box.width, box.height) >= min_len_px:
+                boxes.append(box)
+
+    # Deduplicate
+    if len(boxes) > 1:
+        boxes.sort(key=lambda b: max(b.width, b.height), reverse=True)
+        keep = []
+        for b in boxes:
+            if not any(np.hypot(b.x - k.x, b.y - k.y) < 200
+                       and abs(b.angle - k.angle) < 15 for k in keep):
+                keep.append(b)
+        boxes = keep
+
+    return boxes
+
+
+def _make_rotated_kernel(length: int, angle_deg: float) -> np.ndarray:
+    """Create a rotated line kernel for morphological operations."""
+    # Start with a horizontal line
+    kernel = np.zeros((length, length), dtype=np.uint8)
+    cx, cy = length // 2, length // 2
+    rad = np.radians(angle_deg)
+    x1 = int(cx - length // 2 * np.cos(rad))
+    y1 = int(cy - length // 2 * np.sin(rad))
+    x2 = int(cx + length // 2 * np.cos(rad))
+    y2 = int(cy + length // 2 * np.sin(rad))
+    cv2.line(kernel, (x1, y1), (x2, y2), 1, 1)
+    return kernel
+
+
+def _pair_angled_segments(
+    group: list[tuple],
+    min_gap: int,
+    max_gap: int,
+    min_len_px: int,
+) -> list[tuple]:
+    """Pair parallel angled segments by perpendicular distance."""
+    pairs = []
+    used = set()
+
+    # Sort by perpendicular position (project center onto perpendicular axis)
+    ref_angle = group[0][4]
+    perp_rad = np.radians(ref_angle + 90)
+    group_sorted = sorted(group, key=lambda s: s[0] * np.cos(perp_rad) + s[1] * np.sin(perp_rad))
+
+    for i in range(len(group_sorted)):
+        if i in used:
+            continue
+        si = group_sorted[i]
+
+        for j in range(i + 1, len(group_sorted)):
+            if j in used:
+                continue
+            sj = group_sorted[j]
+
+            # Angle must match (±3°)
+            if abs(si[4] - sj[4]) > 3:
+                continue
+
+            # Perpendicular distance between centers
+            dx = sj[0] - si[0]
+            dy = sj[1] - si[1]
+            # Project onto perpendicular direction
+            dist = abs(dx * np.cos(perp_rad) + dy * np.sin(perp_rad))
+
+            if dist < min_gap or dist > max_gap:
+                continue
+
+            # Length similarity (≥70%)
+            len_ratio = min(si[2], sj[2]) / max(si[2], sj[2])
+            if len_ratio < 0.70:
+                continue
+
+            # Co-terminus: centers should be aligned along the duct direction
+            # (offset along duct axis should be small relative to length)
+            duct_rad = np.radians(si[4])
+            axial_offset = abs(dx * np.cos(duct_rad) + dy * np.sin(duct_rad))
+            if axial_offset > min(si[2], sj[2]) * 0.30:
+                continue
+
+            # Thickness similarity
+            if max(si[3], sj[3]) > 2.5 * min(si[3], sj[3]):
+                continue
+
+            pairs.append((si, sj, dist))
+            used.add(i)
+            used.add(j)
+            break
+
+    return pairs
+
+
+
 
 def _stitch_collinear(boxes: list[BoundingBox]) -> list[BoundingBox]:
     """Merge duct segments that share the same trajectory.
