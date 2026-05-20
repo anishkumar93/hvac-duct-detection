@@ -742,8 +742,10 @@ def _pair_and_validate(
                 continue   # equipment box — both ends are walled
             if _wall_junction_at_endpoint(perp, si, sj, axis):
                 continue   # architectural wall corner
-            if _has_t_opening(roi_binary, si, sj, axis):
-                continue   # wall with T-opening — one side has a break
+            # Damper at one end = confirmed duct, skip T-opening check
+            has_damper = _has_damper(roi_binary, si, sj, axis)
+            if not has_damper and _has_t_opening(roi_binary, si, sj, axis):
+                continue   # wall with opening (no damper to confirm it)
             best_j = j
             break
 
@@ -1157,6 +1159,98 @@ def _has_t_opening(
     if bot_ratio > 0.90 and top_ratio < 0.80:
         return True
 
+    return False
+
+
+def _has_damper(
+    roi_binary: np.ndarray,
+    si: tuple, sj: tuple,
+    axis: str,
+    min_fill: float = 0.60,
+) -> bool:
+    """Return True if at least one end has a damper (not a grid line).
+
+    A damper is a short perpendicular line at the duct endpoint that spans
+    most of the gap. It does NOT extend significantly beyond the corridor
+    walls. A grid line also spans the gap but continues far past the walls
+    on both sides — that's NOT a damper.
+
+    Check: perpendicular fill inside corridor >= 60% AND the line does NOT
+    extend more than 2× the gap width outside the corridor on either side.
+    """
+    if len(si) < 10 or len(sj) < 10:
+        return False
+
+    img_h, img_w = roi_binary.shape[:2]
+
+    if axis == 'h':
+        y1 = int(si[9])
+        y2 = int(sj[7])
+        x1 = int(max(si[0], sj[0]))
+        x2 = int(min(si[2], sj[2]))
+        if y2 <= y1 or x2 <= x1:
+            return False
+        gap = y2 - y1
+        # Check left end
+        if _check_damper_h(roi_binary, x1, y1, y2, gap, min_fill, img_h, img_w):
+            return True
+        # Check right end
+        if _check_damper_h(roi_binary, x2, y1, y2, gap, min_fill, img_h, img_w):
+            return True
+    else:
+        x1 = int(si[8])
+        x2 = int(sj[6])
+        y1 = int(max(si[1], sj[1]))
+        y2 = int(min(si[3], sj[3]))
+        if x2 <= x1 or y2 <= y1:
+            return False
+        gap = x2 - x1
+        # Check top end
+        if _check_damper_v(roi_binary, y1, x1, x2, gap, min_fill, img_h, img_w):
+            return True
+        # Check bottom end
+        if _check_damper_v(roi_binary, y2, x1, x2, gap, min_fill, img_h, img_w):
+            return True
+
+    return False
+
+
+def _check_damper_h(roi_binary, cx, y1, y2, gap, min_fill, img_h, img_w):
+    """Check for a damper (vertical line) at x=cx spanning y1:y2."""
+    for dx in range(-5, 15):
+        x = cx + dx
+        if x < 0 or x >= img_w:
+            continue
+        col = roi_binary[y1:y2, x]
+        if np.count_nonzero(col) < gap * min_fill:
+            continue
+        # Found a perpendicular line inside. Check it doesn't extend far outside.
+        above = roi_binary[max(0, y1 - gap * 2):y1, x]
+        below = roi_binary[y2:min(img_h, y2 + gap * 2), x]
+        ext_above = np.count_nonzero(above)
+        ext_below = np.count_nonzero(below)
+        # A damper is contained within the duct. A grid line extends far outside.
+        if ext_above < gap * 0.3 and ext_below < gap * 0.3:
+            return True
+    return False
+
+
+def _check_damper_v(roi_binary, cy, x1, x2, gap, min_fill, img_h, img_w):
+    """Check for a damper (horizontal line) at y=cy spanning x1:x2."""
+    for dy in range(-5, 15):
+        y = cy + dy
+        if y < 0 or y >= img_h:
+            continue
+        row = roi_binary[y, x1:x2]
+        if np.count_nonzero(row) < gap * min_fill:
+            continue
+        # Check it doesn't extend far outside the corridor
+        left = roi_binary[y, max(0, x1 - gap * 2):x1]
+        right = roi_binary[y, x2:min(img_w, x2 + gap * 2)]
+        ext_left = np.count_nonzero(left)
+        ext_right = np.count_nonzero(right)
+        if ext_left < gap * 0.3 and ext_right < gap * 0.3:
+            return True
     return False
 
 
