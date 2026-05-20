@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ app/
 
-RUN mkdir -p uploads outputs tmp weights
+RUN mkdir -p uploads outputs tmp weights debug
 
 EXPOSE 8000
 

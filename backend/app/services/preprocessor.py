@@ -3,50 +3,64 @@ import numpy as np
 
 
 def preprocess(image_path: str, max_dimension: int = None) -> tuple[np.ndarray, np.ndarray]:
-    """Load and preprocess image for detection. Returns (original, processed binary).
-    Set max_dimension=None to process at full resolution.
+    """Load image at full resolution and apply adaptive binarization.
+
+    max_dimension is accepted for API compatibility but ignored — the pipeline
+    always processes at the original DPI so pixel thresholds stay meaningful.
+
+    Returns (original_bgr, binary) where binary: lines=white(255), bg=black(0).
     """
     img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Cannot read image: {image_path}")
     h, w = img.shape[:2]
-
-    # Downscale only if max_dimension is set
-    scale = 1.0
-    if max_dimension and max(h, w) > max_dimension:
-        scale = max_dimension / max(h, w)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        print(f"[Preprocess] Downscaled from {w}x{h} to {img.shape[1]}x{img.shape[0]}")
-    else:
-        print(f"[Preprocess] Processing at full resolution: {w}x{h}")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # For mechanical drawings: use binary threshold (lines are dark on white)
-    # OTSU works well for clean engineering drawings
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Remove very thin noise (text, hatching) with morphological opening
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
-
-    # Close small gaps in duct lines
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-
+    print(f"[Preprocess] Full resolution: {w}×{h}")
+    gray   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    binary = _binarize(gray)
     return img, binary
 
 
-def deskew(image: np.ndarray) -> np.ndarray:
-    """Correct slight rotation in scanned drawings."""
-    coords = np.column_stack(np.where(image > 0))
-    if len(coords) < 5:
-        return image
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = -(90 + angle)
+def _binarize(gray: np.ndarray) -> np.ndarray:
+    """Adaptive Gaussian thresholding with OTSU fallback.
+
+    Adaptive handles scanned drawings with uneven illumination.
+    OTSU is preferred when adaptive picks up significantly more noise
+    (detected via fill-ratio comparison), which happens on clean vector exports.
+
+    BINARY_INV: dark ink on white paper → white(255) in output (lines=white).
+    """
+    h, w = gray.shape[:2]
+
+    # block_size must be odd and scale with image resolution
+    raw        = max(31, min(h, w) // 100)
+    block_size = raw if raw % 2 == 1 else raw + 1
+
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block_size, 7
+    )
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    a_fill = np.count_nonzero(adaptive) / adaptive.size
+    o_fill = np.count_nonzero(otsu)     / otsu.size
+
+    if o_fill > 0 and a_fill > o_fill * 2.0:
+        binary = otsu
+        print(f"[Preprocess] OTSU selected  (adaptive {a_fill:.1%} vs OTSU {o_fill:.1%})")
     else:
-        angle = -angle
-    if abs(angle) < 0.5:
-        return image
-    h, w = image.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        binary = adaptive
+        print(f"[Preprocess] Adaptive Gaussian (block={block_size}, fill={a_fill:.1%})")
+
+    # Remove isolated noise pixels (1-2px specks from compression artefacts)
+    binary = cv2.morphologyEx(
+        binary, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    )
+    # Close tiny breaks inside line strokes so CC extraction sees whole segments
+    binary = cv2.morphologyEx(
+        binary, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    )
+    return binary
