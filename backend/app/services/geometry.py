@@ -1082,15 +1082,14 @@ def _has_t_opening(
     roi_binary: np.ndarray,
     si: tuple, sj: tuple,
     axis: str,
-    n_samples: int = 10,
-    break_threshold: float = 0.30,
+    n_samples: int = 20,
 ) -> bool:
-    """Return True if one wall has a significant break (T-opening/doorway).
+    """Return True if one wall has a break (T-opening/doorway/window).
 
-    A real duct has two continuous parallel walls. A wall with a doorway or
-    T-junction has a gap where one side is broken. Sample both walls at
-    multiple points along the overlap region. If one wall has >30% of
-    samples missing while the other is continuous, it's a wall not a duct.
+    A real duct has two CONTINUOUS parallel walls. A wall with a doorway
+    or window has a gap. Sample both walls on the raw binary at fine
+    intervals and count breaks. If one wall has ANY break while the other
+    is solid, reject.
     """
     if len(si) < 10 or len(sj) < 10:
         return False
@@ -1102,57 +1101,60 @@ def _has_t_opening(
         x2 = int(min(si[2], sj[2]))
         y_top = int(si[1])
         y_bot = int(sj[1])
-        if x2 <= x1:
+        if x2 - x1 < 50:
             return False
 
-        top_hits = 0
-        bot_hits = 0
+        top_present = []
+        bot_present = []
         for s in range(n_samples):
             sx = x1 + int((x2 - x1) * (s + 0.5) / n_samples)
-            if 0 <= sx < img_w:
-                # Check top wall (±3px around centerline)
-                y_t = max(0, y_top - 3)
-                y_tb = min(img_h, y_top + 4)
-                if np.any(roi_binary[y_t:y_tb, sx] > 0):
-                    top_hits += 1
-                # Check bottom wall
-                y_b = max(0, y_bot - 3)
-                y_bb = min(img_h, y_bot + 4)
-                if np.any(roi_binary[y_b:y_bb, sx] > 0):
-                    bot_hits += 1
+            if sx < 0 or sx >= img_w:
+                continue
+            yt1, yt2 = max(0, y_top - 4), min(img_h, y_top + 5)
+            top_present.append(bool(np.any(roi_binary[yt1:yt2, sx] > 0)))
+            yb1, yb2 = max(0, y_bot - 4), min(img_h, y_bot + 5)
+            bot_present.append(bool(np.any(roi_binary[yb1:yb2, sx] > 0)))
     else:
         y1 = int(max(si[1], sj[1]))
         y2 = int(min(si[3], sj[3]))
         x_left = int(si[0])
         x_right = int(sj[0])
-        if y2 <= y1:
+        if y2 - y1 < 50:
             return False
 
-        top_hits = 0
-        bot_hits = 0
+        top_present = []
+        bot_present = []
         for s in range(n_samples):
             sy = y1 + int((y2 - y1) * (s + 0.5) / n_samples)
-            if 0 <= sy < img_h:
-                x_l = max(0, x_left - 3)
-                x_lr = min(img_w, x_left + 4)
-                if np.any(roi_binary[sy, x_l:x_lr] > 0):
-                    top_hits += 1
-                x_r = max(0, x_right - 3)
-                x_rr = min(img_w, x_right + 4)
-                if np.any(roi_binary[sy, x_r:x_rr] > 0):
-                    bot_hits += 1
+            if sy < 0 or sy >= img_h:
+                continue
+            xl1, xl2 = max(0, x_left - 4), min(img_w, x_left + 5)
+            top_present.append(bool(np.any(roi_binary[sy, xl1:xl2] > 0)))
+            xr1, xr2 = max(0, x_right - 4), min(img_w, x_right + 5)
+            bot_present.append(bool(np.any(roi_binary[sy, xr1:xr2] > 0)))
 
-    # Both walls should be mostly continuous. If one has a large break
-    # (>30% missing) while the other is solid, it's a wall with opening.
-    if n_samples == 0:
+    if len(top_present) < 4 or len(bot_present) < 4:
         return False
-    top_ratio = top_hits / n_samples
-    bot_ratio = bot_hits / n_samples
 
-    # One wall solid (>80%) and the other broken (<70%) = T-opening
-    if top_ratio > 0.80 and bot_ratio < 0.70:
+    top_ratio = sum(top_present) / len(top_present)
+    bot_ratio = sum(bot_present) / len(bot_present)
+
+    # Count breaks (transitions True->False)
+    top_breaks = sum(1 for i in range(1, len(top_present))
+                     if top_present[i - 1] and not top_present[i])
+    bot_breaks = sum(1 for i in range(1, len(bot_present))
+                     if bot_present[i - 1] and not bot_present[i])
+
+    # One wall solid (no breaks) and the other has break(s)
+    if top_breaks == 0 and bot_breaks > 0 and top_ratio > 0.85:
         return True
-    if bot_ratio > 0.80 and top_ratio < 0.70:
+    if bot_breaks == 0 and top_breaks > 0 and bot_ratio > 0.85:
+        return True
+
+    # One wall significantly less present than the other
+    if top_ratio > 0.90 and bot_ratio < 0.80:
+        return True
+    if bot_ratio > 0.90 and top_ratio < 0.80:
         return True
 
     return False
